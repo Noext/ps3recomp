@@ -12,6 +12,10 @@ Makefile
 *.cmake
 !CMakeLists.txt
 !cmake/PS3RecompSPU.cmake
+# Tracked, not generated: the Emscripten toolchain and the SDL2 find_package
+# shim that answers it (SDL2 is a linker port under Emscripten, not a package).
+!cmake/toolchains/emscripten-wasm64.cmake
+!cmake/emscripten/SDL2Config.cmake
 
 # Compiled objects and libraries
 *.o

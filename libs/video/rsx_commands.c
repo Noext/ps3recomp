@@ -502,7 +502,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
       if (method == 0x0180) s_notify_ctx = data;
       if (method == 0x0104) {
           if ((s_notify_ctx & ~7u) == (0x6660420Fu & ~7u)) {
-              extern void vm_write32(uint32_t a, uint32_t v);
+              extern void vm_write32(uint64_t a, uint32_t v);
               extern u32 gcm_io_offset_to_ea(u32 io);
               extern unsigned long long ps3_ms_now(void);
               u32 ea = gcm_io_offset_to_ea(0x0F100000u + ((s_notify_ctx & 7u) ^ 7u) * 0x40u);
@@ -524,7 +524,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
       }
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
       if ((method == 0x1D70 || method == 0x1D74) && s_sem_ctx == 0xFEED0001u) {
-        extern void vm_write32(uint32_t a, uint32_t v);
+        extern void vm_write32(uint64_t a, uint32_t v);
         extern u32 gcm_io_offset_to_ea(u32 io);
         u32 ea = gcm_io_offset_to_ea(s_sem_off);
         u32 val = method == 0x1D74 ? data
@@ -533,7 +533,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
       }
       if (method == 0x1D70) {
-        extern void vm_write32(uint32_t a, uint32_t v);
+        extern void vm_write32(uint64_t a, uint32_t v);
         /* The RSX back-end semaphore write swaps bytes 0<->2 of the value (hw
          * quirk); libgcm's cellGcmSetWriteBackEndLabel PRE-swaps to compensate
          * (SDK gcm_implementation_sub.h: "// swap byte 0 and 2"). Writing the
@@ -551,7 +551,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
       }
       if (method == 0x1D74) {
-        extern void vm_write32(uint32_t a, uint32_t v);
+        extern void vm_write32(uint64_t a, uint32_t v);
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
         return 0;
       } }
