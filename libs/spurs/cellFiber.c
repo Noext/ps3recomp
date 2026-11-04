@@ -28,6 +28,19 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__EMSCRIPTEN__)
+/* Emscripten ships ucontext.h's declarations with no implementation: there is no getcontext, makecontext,
+ * setcontext or swapcontext anywhere in its musl, so the POSIX branch below is linkable-looking and then
+ * fails in wasm-ld. The engines have no way to swap a saved machine context either -- a wasm function's
+ * stack is not addressable that way. What Emscripten does have is emscripten/fiber.h, built on Asyncify:
+ * a "swap" unwinds the current stack into a per-fiber buffer and replays it on the way back. That is a
+ * third mechanism, not a variation on the two below, so it gets its own branch rather than being folded
+ * into the POSIX one. Note that it requires the link to run the Asyncify pass (-sASYNCIFY); without it
+ * emscripten_fiber_swap links and then aborts at the first switch.
+ *
+ * <pthread.h> is included for the lock and condition variable the two host branches share. */
+#include <pthread.h>
+#include <emscripten/fiber.h>
 #else
 #include <pthread.h>
 #include <ucontext.h>
@@ -49,6 +62,14 @@ extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 /* Host stack of each fiber. The guest stack is separate: it holds the guest's own frames, this one the host frames of
  * the lifted code and of the trampoline. */
 #define FIBER_HOST_STACK   (4u * 1024u * 1024u)
+#ifdef __EMSCRIPTEN__
+/* Asyncify buffer per context (a fiber's, and RunFibers' for the scheduler). Only Emscripten has one: on the other
+ * two branches a suspended fiber's frames stay on its own host stack, while here every swap copies them into this
+ * buffer and replays them on the way back. Sized like the host stack -- a chain deep enough to overflow the buffer
+ * would have overflowed the stack it mirrors. Measured at -O2 on an instrumented 1000-deep chain: ~44 bytes per
+ * frame, so 4 MiB is ~95,000 frames. */
+#define FIBER_ASYNCIFY_STACK (4u * 1024u * 1024u)
+#endif
 /* Smallest guest stack CreateFiber accepts. */
 #define FIBER_MIN_STACK    0x400u
 /* Guest stack bytes kept free above the initial r1 (the ABI's back chain and register save area). */
@@ -86,6 +107,10 @@ struct Fiber {
     s32     status;
 #ifdef _WIN32
     void*   host_fiber;
+#elif defined(__EMSCRIPTEN__)
+    emscripten_fiber_t fiber;    /* its own context: c stack, entry and asyncify stack */
+    void*   host_stack;
+    void*   asyncify_stack;      /* where a swap stores the frames it unwinds off this stack */
 #else
     ucontext_t uc;
     void*   host_stack;
@@ -99,6 +124,9 @@ struct Sched {
     int     running;             /* a thread is inside RunFibers */
 #ifdef _WIN32
     void*   back;                /* RunFibers' fiber while it runs one */
+#elif defined(__EMSCRIPTEN__)
+    emscripten_fiber_t back;     /* RunFibers' context while it runs one */
+    void*   back_asyncify;       /* and its asyncify stack */
 #else
     ucontext_t back;             /* RunFibers' context while it runs one */
 #endif
@@ -201,6 +229,128 @@ static void host_yield(Fiber* f)
 {
     SwitchToFiber(f->sched->back);
 }
+
+/* No per-scheduler host state on this branch. */
+static int host_sched_create(Sched* s) { (void)s; return 1; }
+static void host_sched_destroy(Sched* s) { (void)s; }
+#elif defined(__EMSCRIPTEN__)
+/* Probes the *same* contract the ucontext branch gets from getcontext/makecontext: a fresh context with its own
+ * stack, entered once at fiber_entry, that can be swapped to and from arbitrarily often. What each swap means
+ * differs, and the difference is not cosmetic:
+ *
+ *   - swapcontext saves and restores the machine context (registers and stack pointer) in place: the suspended
+ *     frames stay on the fiber's own stack, untouched, until someone swaps back. There is no machine context to
+ *     save in wasm, so emscripten_fiber_swap instead *unwinds* the outgoing stack. Asyncify has instrumented every
+ *     function between the swap and the wasm export above it; on the way out each one spills its live locals into
+ *     the outgoing context's asyncify_data buffer and returns. Switching back replays that buffer, which restores
+ *     the frames and continues after the swap call. The observable contract is the same -- "swapcontext returns
+ *     when someone swaps back to you" -- and no code runs twice (measured: a side effect on every level of a
+ *     five-deep chain fires exactly once across a suspend and a resume). Where the frames live between those two
+ *     points does differ, and it is what a later change can trip over: while the fiber is suspended its frames are
+ *     in the buffer and its stack below the swap point is dead; on resume the frames are rebuilt at the same
+ *     addresses (measured: same frame address and an intact 4 KiB local after a resume). So the stack is the same
+ *     stack, but only once the fiber is running. And every function between the wasm export and the swap has to
+ *     have been instrumented for any of this to work, which is why neither -sASYNCIFY_ONLY nor -sASYNCIFY_REMOVE
+ *     is set here: they would have to name this whole path, and getting it partly wrong fails at the swap, in the
+ *     guest, a long way from the build.
+ *
+ *   - That buffer is the asyncify stack, a separate allocation per context, and it is why each context needs two
+ *     allocations here where the POSIX path needs one. It has no ucontext counterpart at all.
+ *
+ *   - makecontext sets a function pointer plus arguments to be called *once*, on first entry. emscripten_fiber_init
+ *     does the same (entry + user_data), and the runtime NULLs entry after the first call, so later swaps rewind
+ *     instead of re-entering. fiber_entry's signature is void(*)(void*) rather than makecontext's variadic
+ *     argument list: the Fiber* travels in user_data. (The two-unsigned split the ucontext branch uses is a
+ *     makecontext artifact -- it cannot pass a pointer portably -- and has no counterpart here.)
+ *
+ *   - Unlike setcontext, the swap in fiber_leave returns. See the note there.
+ *
+ * Requires the link to run the Asyncify pass (-sASYNCIFY). Without it emscripten_fiber_swap is the stub from
+ * libasync.js that abort()s with "please compile your program with async support", so the link still succeeds and
+ * the first switch is what fails -- see cmake/toolchains/emscripten-wasm64.cmake.
+ *
+ * One known upstream wrinkle, and it is not this file's to fix: any switch cycle leaves Emscripten's
+ * runtimeKeepaliveCounter one higher than it found it (measured: 0 before, 1 after, with libasync.js alone and no
+ * cellFiber code involved). A pthread that runs fibers and then *returns* from its entry function therefore never
+ * reaches _emscripten_thread_exit, because invokeEntryPoint's finish() sees keepRuntimeAlive() and bails, and a
+ * pthread_join on it hangs. Returning through pthread_exit() instead is unaffected. Nothing here can balance the
+ * counter without reaching into Emscripten internals; it is recorded so the next person to see a join hang after
+ * SPURS work has the cause, rather than a stack trace that points at the scheduler. */
+static void fiber_entry(void* p)
+{
+    fiber_body((Fiber*)p);
+}
+
+static int host_create(Fiber* f)
+{
+    /* Two allocations, both of them the same size as the host stack: the asyncify buffer has to be able to hold
+     * everything that would have been on the C stack when the fiber suspends, so making it smaller is a bet that
+     * the fiber never gets deep. (Measured on a 1000-deep instrumented chain at -O2: 44 bytes of buffer per frame,
+     * so at this size the bet would only be lost by a chain four orders of magnitude past anything the guest stack
+     * can hold.) */
+    f->host_stack     = malloc(FIBER_HOST_STACK);
+    f->asyncify_stack = malloc(FIBER_ASYNCIFY_STACK);
+    if (!f->host_stack || !f->asyncify_stack) {
+        free(f->host_stack);
+        free(f->asyncify_stack);
+        f->host_stack = f->asyncify_stack = NULL;
+        return 0;
+    }
+    emscripten_fiber_init(&f->fiber, fiber_entry, f,
+                          f->host_stack, FIBER_HOST_STACK,
+                          f->asyncify_stack, FIBER_ASYNCIFY_STACK);
+    return 1;
+}
+
+/* Releases the host stack and the asyncify buffer. The fiber must not be the one running, nor be resumed again. */
+static void host_destroy(Fiber* f)
+{
+    free(f->host_stack);
+    free(f->asyncify_stack);
+    f->host_stack = NULL;
+    f->asyncify_stack = NULL;
+}
+
+/* RunFibers -> fiber.
+ *
+ * The back context is re-captured on every resume rather than once when the scheduler is created, because what it
+ * records is the *current thread's* stack: emscripten_fiber_init_from_current_context() reads the stack base and
+ * limit that Emscripten's stack-limit bookkeeping holds for the calling thread, and FinishContextSwitch installs
+ * those limits again on every switch into the back context. A scheduler is only prevented from running on two
+ * threads at once, not from being created on one thread and driven by another, so capturing at creation time would
+ * hand RunFibers a stack limit belonging to a different thread. Measured with -sSTACK_OVERFLOW_CHECK=2: capturing
+ * the back context on the creating thread and swapping from another aborts with "Attempt to set SP to 0x... with
+ * stack limits [0x... - 0x...]" -- the worker's SP is outside the creator's recorded range. Capturing on the
+ * swapping thread is clean.
+ *
+ * Nothing is lost by doing it here: the swap writes the outgoing stack pointer into the same struct a moment later,
+ * so the capture is a handful of stores. It does not need to reset the asyncify cursor either -- a once-captured
+ * back context still rewinds correctly, because each unwind starts again at the front of its buffer (measured:
+ * 20,000 resumes of a once-captured back context through a 4 KiB buffer at varying stack depths, no overflow). */
+static void host_resume(Sched* s, Fiber* f)
+{
+    emscripten_fiber_init_from_current_context(&s->back, s->back_asyncify, FIBER_ASYNCIFY_STACK);
+    emscripten_fiber_swap(&s->back, &f->fiber);
+}
+
+static void host_yield(Fiber* f)
+{
+    emscripten_fiber_swap(&f->fiber, &f->sched->back);
+}
+
+/* The back context's asyncify buffer belongs to the scheduler (one RunFibers at a time per scheduler), so it is
+ * allocated with it: host_create()'s counterpart on the scheduler side, with the same failure contract. */
+static int host_sched_create(Sched* s)
+{
+    s->back_asyncify = malloc(FIBER_ASYNCIFY_STACK);
+    return s->back_asyncify != NULL;
+}
+
+static void host_sched_destroy(Sched* s)
+{
+    free(s->back_asyncify);
+    s->back_asyncify = NULL;
+}
 #else
 static void fiber_entry(unsigned hi, unsigned lo)
 {
@@ -236,6 +386,10 @@ static void host_yield(Fiber* f)
 {
     swapcontext(&f->uc, &f->sched->back);
 }
+
+/* No per-scheduler host state on this branch. */
+static int host_sched_create(Sched* s) { (void)s; return 1; }
+static void host_sched_destroy(Sched* s) { (void)s; }
 #endif
 
 /* The fiber has ended with `status`: record it and make the fibers that joined it runnable. The lock is held. */
@@ -252,6 +406,12 @@ static void fiber_leave(Fiber* f)
 {
 #ifdef _WIN32
     SwitchToFiber(f->sched->back);
+#elif defined(__EMSCRIPTEN__)
+    /* A swap, not a setcontext: it returns if this context is ever resumed again, which is exactly the case the
+     * abort() below is here for. Nothing resumes an ended fiber -- RunFibers frees it as soon as the state is
+     * F_DONE and host_destroy() has released these buffers -- so the return path must not be reachable, and if the
+     * accounting is ever wrong this says so instead of jumping into freed memory. */
+    emscripten_fiber_swap(&f->fiber, &f->sched->back);
 #else
     setcontext(&f->sched->back);
 #endif
@@ -314,6 +474,10 @@ s32 cellFiberPpuInitializeScheduler(CellFiberPpuScheduler* scheduler, const Cell
         Sched* s = (Sched*)calloc(1, sizeof *s);
         if (!s) {
             rc = (s32)CELL_FIBER_ERROR_NOMEM;
+        } else if (!host_sched_create(s)) {
+            /* Emscripten's back-context asyncify buffer; a no-op everywhere else. */
+            rc = (s32)CELL_FIBER_ERROR_NOMEM;
+            free(s);
         } else {
             s->ea   = ea;
             s->next = s_scheds;
@@ -352,6 +516,7 @@ s32 cellFiberPpuFinalizeScheduler(CellFiberPpuScheduler* scheduler)
         for (Sched** ps = &s_scheds; *ps; ps = &(*ps)->next) {
             if (*ps == s) { *ps = s->next; break; }
         }
+        host_sched_destroy(s);
         free(s);
     }
     UNLOCK();
