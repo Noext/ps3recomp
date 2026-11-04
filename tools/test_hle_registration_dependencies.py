@@ -22,7 +22,7 @@ rule=text[start:end]
 with tempfile.TemporaryDirectory(prefix='hle-registration-deps-') as tmp:
     root=Path(tmp); sdk=root/'sdk'; (sdk/'tools').mkdir(parents=True)
     (sdk/'libs/system').mkdir(parents=True)
-    for name in ['gen_hle_nids.py','nid_database.py']:
+    for name in ['gen_hle_nids.py','nid_database.py','hle_abi_shape.py']:
         shutil.copyfile(ROOT/'tools'/name,sdk/'tools'/name)
     module=sdk/'libs/system/cellFixture.c'
     module.write_text('int cellFixtureFirst(void) { return 0; }\n')

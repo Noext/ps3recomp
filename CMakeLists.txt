@@ -471,6 +471,12 @@ if(PS3RECOMP_BUILD_TESTS)
     endif()
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        # The generator's ABI-shape analysis over the real libs/ tree: every
+        # registered handler has a prototype, arity agrees with the independent
+        # audit parser, and the unexpressible set is the accounted-for one.
+        add_test(NAME hle_abi_shape
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_hle_abi_shape.py")
         add_test(NAME loaded_image_memory
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_loaded_image_memory.py")
@@ -642,6 +648,30 @@ if(UNIX)
         )
         target_link_libraries(ps3recomp_boot_smoke PRIVATE ps3recomp_runtime)
         set_target_properties(ps3recomp_boot_smoke PROPERTIES LINKER_LANGUAGE CXX)
+
+        # The HLE dispatch trampoline contract: one translation unit, no guest.
+        # On x86-64 SysV the pre-trampoline single-cast dispatch worked by
+        # accident, so "does the title boot" cannot catch a regression here on
+        # native. What this pins is the property wasm64 enforces at the
+        # instruction -- the trampoline's call has the callee's own type -- plus
+        # the r3 extension the old cast produced, which titles read as (s32)r3.
+        # Self-contained: the dispatcher plus the smallest stubs that link it
+        # (see the test's header). No loader, no guest, no ELF.
+        add_executable(test_hle_trampoline
+            runtime/ppu/tests/test_hle_trampoline.cpp
+            runtime/ppu/ppu_hle.cpp
+        )
+        target_include_directories(test_hle_trampoline PRIVATE
+            "${SMOKE_GEN}"                                 # the generated ppu_recomp.h
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu"
+        )
+        target_link_libraries(test_hle_trampoline PRIVATE ps3recomp_runtime)
+        set_target_properties(test_hle_trampoline PROPERTIES LINKER_LANGUAGE CXX)
+        add_dependencies(test_hle_trampoline ps3recomp_boot_smoke)
+        if(PS3RECOMP_BUILD_TESTS)
+            add_test(NAME hle_trampoline COMMAND test_hle_trampoline)
+        endif()
 
         # Where the runnable image lands, so CI and a developer both say
         #   ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
