@@ -732,4 +732,17 @@ u32 rsx_null_backend_readback_center(void)
 
 u32 rsx_null_backend_guest_draws(void) { return 0; }
 
+/* The whole frame, not just the centre pixel: this is what a browser canvas
+ * blits. Handing out the live buffer rather than a copy keeps the present path
+ * free -- the caller has the pixels until the next present overwrites them,
+ * which is exactly the window a blit needs and why the header says so. */
+const u32* rsx_null_backend_framebuffer(u32* out_w, u32* out_h)
+{
+    if (out_w) *out_w = s_soft.width;
+    if (out_h) *out_h = s_soft.height;
+    return s_soft.fb;
+}
+
+u32 rsx_null_backend_frame_count(void) { return (u32)s_soft.presented; }
+
 #endif /* _WIN32 */
