@@ -611,8 +611,20 @@ void func_00010000(ppu_context* ctx)
 
     /* Installed last so it runs first: exit() calls handlers in reverse order
      * of registration, and this one must get its verdict out while the rest of
-     * the process is still standing. */
+     * the process is still standing.
+     *
+     * Under Emscripten this is not enough. Musl's exit() there does not run
+     * the atexit chain that __cxa_atexit fills, so the verdict never ran and a
+     * perfect 11/11 run printed no PASS and reported the guest's status as its
+     * own. exit(0) from the harness is still reachable, so the fix is to make
+     * sys_process_exit call the handler explicitly rather than depend on the
+     * libc's teardown order. */
+#if defined(__EMSCRIPTEN__)
+    extern void (*g_smoke_atexit_hook)(void);
+    g_smoke_atexit_hook = smoke_verify;
+#else
     atexit(smoke_verify);
+#endif
 
     ctx->gpr[3] = SMOKE_EXIT_STATUS;
     func_00010700(ctx); DRAIN_TRAMPOLINE(ctx);
