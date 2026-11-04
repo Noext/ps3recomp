@@ -57,6 +57,19 @@ u32 rsx_null_backend_readback_center(void);
  * always 0 here, this backend has no shader path. Mirrors the Metal hook so
  * the host harness can name one entry point per backend. */
 u32 rsx_null_backend_guest_draws(void);
+
+/* The presented framebuffer, 0x00RRGGBB, width*height u32s. Read-only; valid
+ * until the next present. NULL before the backend is initialised.
+ *
+ * The whole frame, not just the centre pixel above: this is what a browser
+ * canvas blits. out_w/out_h may be NULL if only the pixels are wanted. */
+const u32* rsx_null_backend_framebuffer(u32* out_w, u32* out_h);
+
+/* Presents this backend has made since init, so a host can tell "the guest is
+ * running and flipping" from "the canvas is blitting stale pixels". Counts
+ * every present, including the ticker's free presents before the first guest
+ * flip, because those still put new pixels in the framebuffer. */
+u32 rsx_null_backend_frame_count(void);
 #endif
 
 /* The live draw engine binds to this window and takes over presentation. */

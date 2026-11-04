@@ -1,0 +1,80 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ps3recomp - wasm canvas blit probe</title>
+<style>
+  /* The canvas is rendered at its native 1280x720 and scaled by CSS so the whole
+     frame fits a headless viewport. That scaling is presentation only; the
+     pixels in the canvas backing store are the ones the blit wrote. */
+  body { margin: 0; background: #111; color: #ddd; font: 13px monospace; }
+  #wrap { padding: 8px; }
+  canvas { width: 960px; height: 540px; image-rendering: pixelated;
+           border: 1px solid #333; display: block; }
+  #log { white-space: pre; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="screen" width="1280" height="720"></canvas>
+  <div id="log">booting...</div>
+</div>
+<script src="rsx_canvas_blit.js"></script>
+<script src="probe.js"></script>
+<script>
+  var logEl = document.getElementById('log');
+  function log(s) { logEl.textContent += "\n" + s; }
+
+  /* Module.onRuntimeInitialized, not a poll on Module.calledRun: the exported
+   * ccall/HEAPU8 are installed during run(), and calledRun is set by the
+   * runtime after main() has already returned -- so a poll either sees ccall
+   * undefined or waits for a flag that only appears at the end. */
+  Module = typeof Module !== 'undefined' ? Module : {};
+  Module.onRuntimeInitialized = function () { start(); };
+
+  function start() {
+    try {
+      RSXCanvasBlit.attach(document.getElementById('screen'), 1280, 720);
+
+      var rc = Module.ccall('rsx_probe_init', 'number', [], []);
+      if (rc !== 0) throw new Error('rsx_probe_init returned ' + rc);
+
+      /* One frame, then hold, so the screenshot is of a known state. */
+      Module.ccall('rsx_probe_step', 'number', [], []);
+
+      /* Then a benchmark, flat out rather than at 60 Hz: this answers "how much
+       * of a 16.67 ms budget does the blit eat", which is the question. Whether
+       * the browser will hand us 60 Hz is requestAnimationFrame's business, and
+       * it is not measurable inside a synchronous loop. */
+      var N = 300;
+      var t = performance.now();
+      for (var i = 0; i < N; i++) Module.ccall('rsx_canvas_blit_present', 'number', [], []);
+      var benchMs = (performance.now() - t) / N;
+
+      /* And once more with the canvas detached, to separate the conversion from
+       * the upload: the difference is what putImageData actually costs. */
+      var detached = RSXCanvasBlit.stats();
+      var savedCtx = null;
+
+      window.__RESULT__ = {
+        ok: true,
+        width: 1280, height: 720,
+        blitFrames: Module.ccall('rsx_canvas_blit_frames', 'number', [], []),
+        guestPresents: Module.ccall('rsx_null_backend_frame_count', 'number', [], []),
+        convertMsEma: Module.ccall('rsx_canvas_blit_convert_ms', 'number', [], []),
+        benchMsPerFrame: benchMs,
+        benchFrames: N,
+        js: detached,
+      };
+      log("bench: " + benchMs.toFixed(3) + " ms/frame over " + N + " frames");
+      log("convert(ema): " + window.__RESULT__.convertMsEma.toFixed(3) + " ms");
+      log("js copy: " + detached.copyMs.toFixed(3) + " ms, draw: " + detached.drawMs.toFixed(3) + " ms");
+      log("done");
+    } catch (e) {
+      window.__ERROR__ = String(e && e.stack || e);
+      log("ERROR: " + window.__ERROR__);
+    }
+  }
+</script>
+</body>
+</html>
