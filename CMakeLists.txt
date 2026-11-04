@@ -449,6 +449,26 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
 
+    # The RSX fragment decompiler's WGSL dialect: the same decode loop that
+    # emits HLSL for D3D12/Metal/Vulkan emits WGSL for WebGPU, so no shader
+    # compiler ships to the browser. Needs nothing but a C compiler -- the
+    # test asserts on the text, and the *.wgsl files it can dump are then
+    # validated with naga when that is installed (tools/validate_fp_wgsl.py).
+    #
+    # Inert when naga is absent: the CMake test runs the C checks only, and
+    # the naga pass is a second test registered only when the tool is found.
+    # That keeps a machine with no Rust toolchain building and testing
+    # everything it otherwise would.
+    add_executable(test_fp_wgsl
+        libs/video/tests/test_fp_wgsl.c
+        libs/video/rsx_fp_decompiler.c
+    )
+    target_include_directories(test_fp_wgsl PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    add_test(NAME fp_wgsl COMMAND test_fp_wgsl)
+
     if(NOT WIN32)
         # The vector single-precision ops against the exact per-lane references.
         add_executable(test_spu_float_exact
@@ -472,6 +492,23 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_rsx_present_policy PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
+    # The WGSL the fragment decompiler emits, validated by naga -- the
+    # reference WGSL implementation, and the front end every WebGPU browser
+    # implementation is built on. Registered only where both naga and Python
+    # are available, so a machine with no Rust toolchain still configures and
+    # builds; the text checks above are the part that always runs.
+    find_program(PS3RECOMP_NAGA naga)
+    if(PS3RECOMP_NAGA)
+        find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+    endif()
+    if(PS3RECOMP_NAGA AND Python3_Interpreter_FOUND)
+        add_test(NAME fp_wgsl_naga
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_fp_wgsl.py"
+                --test "$<TARGET_FILE:test_fp_wgsl>"
+                --naga "${PS3RECOMP_NAGA}")
+        set_tests_properties(fp_wgsl_naga PROPERTIES TIMEOUT 120)
+    endif()
 
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
