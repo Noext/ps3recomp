@@ -139,6 +139,17 @@ else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
     # here -- docs/BUILDING.md already lists it as the Linux/macOS dependency.
+    #
+    # Under Emscripten SDL2 is not a package at all: emcc links the wasm build
+    # of it as a linker port (-sUSE_SDL=2) and the headers come from the
+    # sysroot, so there is nothing for find_package(SDL2) to find on a fresh
+    # SDK and the FATAL_ERROR below would fire before anything is compiled.
+    # cmake/emscripten/SDL2Config.cmake answers that find_package with an
+    # INTERFACE target carrying the port flag. SDL2_DIR is set only here, and
+    # only when the caller has not chosen one, so no native host is affected.
+    if(EMSCRIPTEN AND NOT SDL2_DIR)
+        set(SDL2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cmake/emscripten")
+    endif()
     find_package(SDL2 QUIET)
     if(SDL2_FOUND)
         if(TARGET SDL2::SDL2)
