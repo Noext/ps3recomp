@@ -97,6 +97,56 @@ set(PS3RECOMP_WASM_MAX_MEMORY "16GB" CACHE STRING
 set(PS3RECOMP_WASM_PTHREAD_POOL "8" CACHE STRING
     "Emscripten -sPTHREAD_POOL_SIZE; worker threads kept warm")
 
+# ASYNCIFY: not optional, and not a general preference.
+#
+# libs/spurs/cellFiber.c implements cellFiber's context switch on
+# emscripten_fiber_swap under Emscripten, because there is no ucontext there
+# (ucontext.h is declarations only; wasm-ld reports getcontext/makecontext/
+# setcontext/swapcontext undefined). emscripten_fiber_swap is implemented by
+# libasync.js and is a *stub that abort()s* unless the Asyncify pass ran, so
+# without this flag the link succeeds and the first fiber switch in the guest
+# dies. That is the whole reason it is here: the link is not the test.
+#
+# The cost is real and measured on ps3recomp_boot_smoke at -O3:
+#   wasm 1,676,695 -> 2,535,375 bytes (+51%), gzip 610,578 -> 852,422 (+40%).
+# Asyncify rewrites every function that can reach an instrumented import to
+# spill its locals and return, so a narrower setting was looked for first:
+#
+#   -sASYNCIFY_ONLY=<cellFiber functions>  does not work. The uninstrumented
+#   functions are the guest's own lifted code, which sits between
+#   RunFibers and the swap and is not something a name list in this file can
+#   enumerate (a title's lifted functions are generated per game). Measured:
+#   the fiber test then fails at the first switch, with the scheduler running
+#   and no fiber entered.
+#
+# So the choice is "instrument everything, or cellFiber does not work"; there
+# is no middle setting to reach for. -sASYNCIFY_JSPI is not an option either:
+# it needs Wasm stack switching, which wasm64 Node 24 does not enable.
+#
+# The 4 MiB asyncify buffer per fiber that this buys is allocated in
+# cellFiber.c, not here.
+set(PS3RECOMP_WASM_ASYNCIFY ON CACHE BOOL
+    "Emscripten -sASYNCIFY; cellFiber's fiber switch needs it at run time")
+
+# NODERAWFS: the produced module reads the host filesystem directly.
+#
+# Without it Emscripten's default filesystem is an in-memory one that starts
+# empty, so a program whose whole job is "open the ELF named on the command
+# line" finds nothing: ps3recomp_boot_smoke prints
+#   [ppu] cannot open build-wasm64/smoke/smoke.elf
+# even though the file is right there. Native runs never hit this because the
+# host fopen is the real one.
+#
+# The alternatives are worse for a test runner: --preload-file would have to
+# name the ELF at link time (which makes every target's link depend on a
+# generated artifact), and a MEMFS mount set up per program puts host-IO code
+# in every entry point. NODERAWFS is the setting Emscripten provides for
+# exactly this, and it is node-only -- which is what this toolchain already
+# assumes (see CMAKE_CROSSCOMPILING_EMULATOR below: ctest runs the .js through
+# node). A browser build must turn it off and arrange its own file source.
+set(PS3RECOMP_WASM_NODERAWFS ON CACHE BOOL
+    "Emscripten -sNODERAWFS; node builds read the host filesystem directly")
+
 # Compile-time flags. -m64 has to be here, not only in the link flags: the
 # platform module inspects ${CMAKE_C_FLAGS} to choose CMAKE_SIZEOF_VOID_P and
 # the wasm64-emscripten library architecture, and it does that while processing
@@ -105,9 +155,18 @@ set(_ps3recomp_wasm_compile_flags "-m64 -pthread")
 
 # Link-time flags. These are -s settings the linker consumes; putting them in
 # the compile flags only earns a "linker setting ignored during compilation"
-# warning on every single translation unit (172 of them).
-set(_ps3recomp_wasm_link_flags
-    "-m64 -pthread"
+# warning on every single translation unit (172 of them). -sASYNCIFY is one of
+# those (emcc: "linker setting ignored during compilation: 'ASYNCIFY'"): it is
+# a whole-program pass over the linked module, so it belongs to the link and
+# nowhere else.
+set(_ps3recomp_wasm_link_flags "-m64 -pthread")
+if(PS3RECOMP_WASM_ASYNCIFY)
+    list(APPEND _ps3recomp_wasm_link_flags "-sASYNCIFY")
+endif()
+if(PS3RECOMP_WASM_NODERAWFS)
+    list(APPEND _ps3recomp_wasm_link_flags "-sNODERAWFS=1")
+endif()
+list(APPEND _ps3recomp_wasm_link_flags
     "-sINITIAL_MEMORY=${PS3RECOMP_WASM_INITIAL_MEMORY}"
     "-sALLOW_MEMORY_GROWTH=1"
     "-sMAXIMUM_MEMORY=${PS3RECOMP_WASM_MAX_MEMORY}"
