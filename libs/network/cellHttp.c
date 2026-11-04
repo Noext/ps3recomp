@@ -24,6 +24,7 @@ typedef SOCKET http_socket_t;
 #define http_closesocket closesocket
 #else
 #include <sys/socket.h>
+#include <sys/time.h>   /* struct timeval for SO_RCVTIMEO/SO_SNDTIMEO */
 #include <netinet/in.h>
 #include <netdb.h>
 #include <unistd.h>
