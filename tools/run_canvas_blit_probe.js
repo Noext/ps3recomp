@@ -15,9 +15,14 @@
  */
 'use strict';
 
-const [,, probeDir, shotPath, chromeArg] = process.argv;
+/* Trailing arguments after [chrome] are extra Chromium flags. That is how the
+ * WebGPU probe gets --enable-unsafe-webgpu --use-angle=swiftshader
+ * --enable-features=Vulkan --use-vulkan=swiftshader without a second driver: the
+ * server, the CDP plumbing, the canvas-clip screenshot and the toDataURL readback
+ * are identical, so only the flag list differs between the two probes. */
+const [,, probeDir, shotPath, chromeArg, ...extraFlags] = process.argv;
 if (!probeDir || !shotPath) {
-  console.error('usage: run_canvas_blit_probe.js <probe-dir> <screenshot.png> [chrome]');
+  console.error('usage: run_canvas_blit_probe.js <probe-dir> <screenshot.png> [chrome] [flags...]');
   process.exit(2);
 }
 
@@ -103,9 +108,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     '--headless=new',
     '--remote-debugging-port=0',
     `--user-data-dir=${userDir}`,
-    '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
+    '--no-sandbox', '--disable-dev-shm-usage',
     '--hide-scrollbars',
     '--window-size=1000,700',
+    /* --disable-gpu is added only when no WebGPU flag was passed. It is right for
+     * the CPU blit probe (which wants no GPU at all) and fatal for the WebGPU one
+     * (which cannot get an adapter with the GPU process disabled). Keying it off
+     * the extra flags keeps the blit probe on exactly the command line it had. */
+    ...(extraFlags.length ? [] : ['--disable-gpu']),
+    ...extraFlags,
     'about:blank',
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
 

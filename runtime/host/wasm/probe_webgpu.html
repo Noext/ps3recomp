@@ -1,0 +1,118 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ps3recomp - wasm WebGPU backend probe</title>
+<style>
+  /* The canvas is a WebGPU surface. Its backing store is 1280x720; the CSS scale
+     is presentation only, and the pixels in the backing store are what the render
+     pass wrote. */
+  body { margin: 0; background: #111; color: #ddd; font: 13px monospace; }
+  #wrap { padding: 8px; }
+  canvas { width: 960px; height: 540px; image-rendering: pixelated;
+           border: 1px solid #333; display: block; }
+  #log { white-space: pre; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="screen" width="1280" height="720"></canvas>
+  <div id="log">booting...</div>
+</div>
+<script src="probe_webgpu.js"></script>
+<script>
+  var logEl = document.getElementById('log');
+  function log(s) { logEl.textContent += "\n" + s; }
+
+  Module = typeof Module !== 'undefined' ? Module : {};
+
+  /* THE CONTRACT. This is the whole reason the C backend can be synchronous:
+   * requestAdapter/requestDevice are awaited here, in the page's own async
+   * context where awaiting is free, and the resulting device is handed to the
+   * module through Module.preinitializedWebGPUDevice. The C side then obtains it
+   * synchronously with emscripten_webgpu_get_device() and never needs ASYNCIFY or
+   * JSPI, which would otherwise have to reshape every caller of the vtable.
+   *
+   * Note it must be a real GPUDevice (a JS object), not a pointer: the binding
+   * imports it and hands back a WGPUDevice the C side can use. */
+  Module.onRuntimeInitialized = async function () {
+    try {
+      if (!navigator.gpu) throw new Error('navigator.gpu is not available');
+      var adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      if (!adapter) throw new Error('navigator.gpu.requestAdapter returned null');
+      Module.preinitializedWebGPUDevice = await adapter.requestDevice();
+      var info = adapter.info || {};
+      window.__ADAPTER__ = [info.vendor, info.architecture, info.device, info.description]
+                             .filter(Boolean).join('|');
+      log('adapter: ' + window.__ADAPTER__);
+      start();
+    } catch (e) {
+      window.__ERROR__ = String(e && e.stack || e);
+      log('ERROR: ' + window.__ERROR__);
+    }
+  };
+
+  function isReady() {
+    return Module.ccall('rsx_webgpu_backend_is_ready', 'number', [], []) !== 0;
+  }
+
+  function start() {
+    try {
+      var rc = Module.ccall('rsx_probe_init', 'number', [], []);
+      if (rc !== 0) throw new Error('rsx_probe_init returned ' + rc);
+      if (!isReady()) return waitReady(0);
+      stepAndFinish();
+    } catch (e) {
+      window.__ERROR__ = String(e && e.stack || e);
+      log('ERROR: ' + window.__ERROR__);
+    }
+  }
+
+  /* A real host calls pump() once per requestAnimationFrame: it is what advances
+   * the device's event queue and, on the fallback path, what carries the async
+   * bring-up forward. The probe exercises the same shape rather than assuming the
+   * preinitialized path is ready on return. */
+  function waitReady(n) {
+    if (n > 300) {
+      window.__ERROR__ = 'backend never became ready';
+      log('ERROR: ' + window.__ERROR__);
+      return;
+    }
+    Module.ccall('rsx_webgpu_backend_pump', 'number', [], []);
+    if (isReady()) return stepAndFinish();
+    requestAnimationFrame(function () { waitReady(n + 1); });
+  }
+
+  function stepAndFinish() {
+    try {
+      var s = Module.ccall('rsx_probe_step', 'number', [], []);
+      if (s !== 0) throw new Error('rsx_probe_step returned ' + s);
+      /* A WebGPU canvas is composited when the current task yields, so the frame
+       * the submit produced is only in the canvas after a rAF. Screenshotting in
+       * the same task would capture the state before the submit landed. */
+      requestAnimationFrame(function () {
+        requestAnimationFrame(function () {
+          window.__RESULT__ = {
+            ok: true,
+            width: 1280, height: 720,
+            adapter: window.__ADAPTER__,
+            frames: Module.ccall('rsx_webgpu_backend_frame_count', 'number', [], []),
+            clearColor: Module.ccall('rsx_webgpu_backend_debug_color', 'number', [], []),
+            surfaceFormat: Module.ccall('rsx_webgpu_backend_surface_format', 'number', [], []),
+            frameMs: Module.ccall('rsx_webgpu_backend_frame_ms', 'number', [], []),
+            guestDraws: Module.ccall('rsx_webgpu_backend_guest_draws', 'number', [], []),
+          };
+          log('frames: ' + window.__RESULT__.frames +
+              ' clear: 0x' + (window.__RESULT__.clearColor >>> 0).toString(16) +
+              ' format: ' + window.__RESULT__.surfaceFormat);
+          log('done');
+        });
+      });
+    } catch (e) {
+      window.__ERROR__ = String(e && e.stack || e);
+      log('ERROR: ' + window.__ERROR__);
+    }
+  }
+</script>
+</body>
+</html>

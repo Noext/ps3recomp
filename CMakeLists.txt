@@ -194,6 +194,37 @@ if(PS3RECOMP_RSX_VULKAN)
     message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
 endif()
 
+# ---------------------------------------------------------------------------
+# WebGPU RSX backend (Emscripten only)
+# ---------------------------------------------------------------------------
+# libs/video/rsx_webgpu_backend.c is guarded by __EMSCRIPTEN__ internally, so it
+# compiles to an empty translation unit on every native platform and the block
+# below is inert there by construction -- nothing here reaches a native configure.
+#
+# The port flags are the ones that matter and both are Emscripten-only:
+#
+#   --use-port=emdawnwebgpu  Dawn's webgpu.h-on-WebGPU binding. Required at BOTH
+#                            compile and link: the compile side supplies the
+#                            header and struct layout, the link side supplies the
+#                            JS library and webgpu.cpp. -sUSE_WEBGPU=1 is
+#                            rejected by this port ("emdawnwebgpu may not be used
+#                            with -sUSE_WEBGPU=1"), so it is not an alternative.
+#
+#   -sDEFAULT_TO_CXX         emdawnwebgpu requires a C++ link. The error is
+#                            explicit: "emdawnwebgpu requires C++. Link using
+#                            em++ (or emcc -sDEFAULT_TO_CXX), instead of emcc."
+#                            This keeps every source in the runtime plain C/C++
+#                            as before and only changes how the final link runs.
+#
+# Neither flag is a native build concern, which is why they sit inside
+# if(EMSCRIPTEN) rather than in the shared link line.
+if(EMSCRIPTEN)
+    target_compile_options(ps3recomp_runtime PUBLIC --use-port=emdawnwebgpu)
+    target_link_options(ps3recomp_runtime PUBLIC --use-port=emdawnwebgpu)
+    target_link_options(ps3recomp_runtime PUBLIC -sDEFAULT_TO_CXX)
+    message(STATUS "  WebGPU:       RSX backend enabled (rsx_webgpu_backend.c, emdawnwebgpu)")
+endif()
+
 # cellVdec decodes H.264 / MPEG-2 through FFmpeg when this is on. libavcodec
 # is loaded at run time (dlopen / LoadLibrary), never linked, so building needs
 # only the FFmpeg headers, and a binary run where FFmpeg is absent -- or with
@@ -483,6 +514,13 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME user_memory_domain
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_user_memory_domain.py")
+        # The WebGPU backend's acceptance test. Its native half always runs (the
+        # backend is inert off Emscripten); its browser half builds the same C for
+        # wasm64 and checks the canvas pixels, and skips loudly when emcc or
+        # Chromium is absent so a runner without them still gets the native half.
+        add_test(NAME rsx_webgpu_backend
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_rsx_webgpu_backend.py")
     endif()
 endif()
 
