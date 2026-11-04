@@ -42,6 +42,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../runtime/memory/vm.h"   /* vm_place_guest_window: the wasm64 arena */
 
 #ifndef _WIN32
 #include <sys/mman.h>   /* mmap: the guest arena, see alloc_guest_vm */

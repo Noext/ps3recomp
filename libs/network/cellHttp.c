@@ -27,6 +27,7 @@ typedef SOCKET http_socket_t;
 #include <sys/time.h>   /* struct timeval for SO_RCVTIMEO/SO_SNDTIMEO */
 #include <netinet/in.h>
 #include <netdb.h>
+#include <sys/time.h>   /* struct timeval for SO_RCVTIMEO/SO_SNDTIMEO */
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>

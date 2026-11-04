@@ -31,6 +31,7 @@
 #include "../ppu_tls.h"
 #include "../../platform/win32_compat.h"      /* Sleep, GetTickCount64, threads on POSIX */
 #include "../../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+#include "../../memory/vm.h"          /* vm_place_guest_window: the wasm64 arena */
 /* The lifted ppu_recomp.h already defines `struct ppu_context` (identical to
  * runtime/ppu/ppu_context.h by design -- "keep the two in sync"). A syscall
  * header included later (sys_ppu_thread.h -> lv2_syscall_table.h -> ppu_context.h)
@@ -1139,8 +1140,17 @@ int main(int argc, char** argv)
     vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
     ppu_vm_size = 0;   /* full 32-bit space backed -> OOB guard unnecessary */
 #else
-    vm_base = (uint8_t*)calloc(1, 0xE0000000u);
-    ppu_vm_size = 0xE0000000u;
+    /* Under Emscripten the arena has to be the base the linker reserved above
+     * 4 GB; a plain calloc lands wherever dlmalloc puts it and is not 4 GB
+     * aligned, which breaks the GUEST_EA truncation. Everywhere else the helper
+     * returns NULL and the allocator below is still the right answer. */
+    vm_base = vm_place_guest_window();
+    if (vm_base) {
+        ppu_vm_size = 0;   /* the whole window is backed by linear memory */
+    } else {
+        vm_base = (uint8_t*)calloc(1, 0xE0000000u);
+        ppu_vm_size = 0xE0000000u;
+    }
 #endif
     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
 
