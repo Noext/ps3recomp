@@ -31,6 +31,11 @@
   #include <unistd.h>
 #endif
 
+#ifdef __EMSCRIPTEN__
+  #include <errno.h>           /* ENOSYS, for the honest mprotect refusal */
+  #include <emscripten/heap.h> /* emscripten_get_heap_size / _max */
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -141,13 +146,32 @@ static inline uint32_t vm_host_page_size(void)
 extern uint8_t* vm_base;
 
 #ifndef _WIN32
-/* mprotect over the host pages covering [addr, addr+size). */
+/* mprotect over the host pages covering [addr, addr+size).
+ *
+ * Returns 0 on success and nonzero on refusal, like mprotect. Under Emscripten
+ * it always refuses, because calling mprotect there would not be a refusal:
+ * the runtime stubs __syscall_mprotect out to a bare "return 0" ("let's not and
+ * say we did"), so a caller would be told the pages changed when they did not.
+ * A guard page that reports success and then does not fault is worse than no
+ * guard page, because everything above it believes it is protected.
+ *
+ * The two read/write calls vm_init() would make are not routed through here,
+ * so nothing that must work depends on this returning 0; what does depend on it
+ * is guard pages and vm_protect(), and those are exactly the callers that need
+ * to hear "no". ENOSYS matches the errno musl would give for a syscall the
+ * host does not implement; CELL_ENOMEM is what vm_commit() reports upward. */
 static inline int vm__mprotect_pages(uint32_t addr, uint32_t size, int prot)
 {
+#ifdef __EMSCRIPTEN__
+    (void)addr; (void)size; (void)prot;
+    errno = ENOSYS;
+    return -1;
+#else
     uint64_t pg = vm_host_page_size();
     uint64_t a0 = (uint64_t)addr & ~(pg - 1u);
     uint64_t a1 = ((uint64_t)addr + size + pg - 1u) & ~(pg - 1u);
     return mprotect(vm_base + a0, (size_t)(a1 - a0), prot);
+#endif
 }
 #endif
 
@@ -156,6 +180,44 @@ static inline int vm__mprotect_pages(uint32_t addr, uint32_t size, int prot)
  * addr == host addr), so "is the VM ready?" must test this, not vm_base. */
 extern uint32_t ppu_vm_size;
 #define VM_READY (vm_base != 0 || ppu_vm_size != 0)
+
+/*
+ * Where the hosts get their guest arena.
+ *
+ * Each host allocates this itself and assigns vm_base directly -- boot_main's
+ * scaffold, host_posix, host_main, templates/project and wave all do -- because
+ * they each want a different arena size and a different ppu_vm_size. That is
+ * fine natively, where an allocator can be asked for a 4 GB-aligned block. It
+ * is not fine under Emscripten, where calloc(1, 0xE0000000) returns something
+ * like 0x000116c0-bearing and mmap ignores alignment hints, so the base is
+ * 4 GB-aligned only by luck (measured: it is not, in Node or in Chromium).
+ *
+ * So this is the one place that knows how to get the base on each platform.
+ * Returns NULL when the caller should carry on with its own allocator, which is
+ * every native build: only Emscripten needs to be told, because only there does
+ * the base have to be a constant the linker reserved.
+ *
+ * A host that gets a non-NULL result must NOT free it; it is inside the module's
+ * own linear memory. vm_shutdown() handles the bookkeeping.
+ */
+static inline uint8_t* vm_place_guest_window(void)
+{
+#if defined(__EMSCRIPTEN__)
+  #if defined(__wasm64__)
+    /* Inside linear memory if the module was linked with a large enough
+     * initial memory; above the segments if it was linked with
+     * -sGLOBAL_BASE=0x200000000. vm_init() re-checks both. */
+    if ((uint64_t)(uintptr_t)(1ull << 32) + VM_TOTAL_SIZE
+            > (uint64_t)emscripten_get_heap_size())
+        return NULL;
+    return (uint8_t*)(uintptr_t)(1ull << 32);
+  #else
+    return NULL;   /* wasm32 has no 4 GB-aligned address but 0, which is taken */
+  #endif
+#else
+    return NULL;   /* native: the host's own allocator is correct */
+#endif
+}
 
 /* ---------------------------------------------------------------------------
  * Initialization / Shutdown
@@ -181,12 +243,88 @@ static inline void vm_shutdown(void);
  * address that moves with every run, so a write lands somewhere in the guest
  * arena and the guest's own variable keeps whatever was in it. The cost of
  * removing the question is one over-reservation that is trimmed back.
+ *
+ * WebAssembly needs a third answer, because neither of the two above applies
+ * there. There is no address space to reserve: the module's linear memory IS
+ * the address space, one contiguous buffer that grows by being replaced.
+ * Emscripten's mmap is not a kernel reservation either -- it is a dlmalloc
+ * call that really allocates, so the over-map above asks for 8 GB of committed
+ * heap and fails with ENOMEM (measured: errno 48, in Node and in Chromium).
+ * Nor can the base be picked: mmap ignores address hints under Emscripten and
+ * returns EINVAL for a non-zero addr, and a 4 GB-aligned static array does not
+ * even compile, because a wasm object file caps a single section at 4 GB
+ * ("section size does not fit in a uint32_t").
+ *
+ * So the window is placed by construction rather than allocation. Under wasm64
+ * a pointer is 64-bit and linear memory has room above 4 GB, so the base can
+ * simply be the constant 0x100000000. The module is then linked with
+ * -sGLOBAL_BASE=0x200000000 so that everything the toolchain places -- data
+ * segments, stack, dlmalloc heap -- sits above 8 GB, which leaves
+ * [4 GB, 8 GB) permanently empty and exactly overlays the guest. That is
+ * stronger than either native path: a link-time constant, not an allocation
+ * that might land anywhere, so the invariant holds on the first attempt and on
+ * every run, with no retry loop and no trim.
+ *
+ * The cost, stated plainly because it decides whether this ships: there is no
+ * lazy backing for anonymous memory in the browser, so the module declares its
+ * maximum up front and the engine commits only the pages that are touched. In
+ * Chromium 156 an 8.5 GB initial / 16 GB maximum linear memory instantiates in
+ * about 2 ms, and RSS for the whole browser process tree rises by ~264 MB when
+ * the window is placed and 256 MB of main memory is memset. See
+ * docs/WASM_VM.md for the measurements.
  */
 static inline int32_t vm_init(void)
 {
     if (vm_base != NULL) return CELL_OK; /* already initialized */
 
-#ifdef _WIN32
+#if defined(__EMSCRIPTEN__)
+    /*
+     * wasm64 only. wasm32 has exactly one 4 GB-aligned base, zero, and that is
+     * where the module's own data, stack and heap live: placing the guest there
+     * makes the boot memset below wipe the program -- measured, not assumed;
+     * under wasm32 the guest's first byte and the program's own static data
+     * land in the same page. vm_place_guest_window() returns NULL for wasm32,
+     * which becomes ENOMEM here rather than corruption later.
+     */
+  #if !defined(__wasm64__)
+    return CELL_ENOMEM;
+  #else
+    uint8_t*  window = vm_place_guest_window();
+    uint64_t  end;
+
+    if (!window) return CELL_ENOMEM;
+    end = (uint64_t)(uintptr_t)window + VM_TOTAL_SIZE;
+
+    /* One more check, and it is the one a build gets wrong silently: the
+     * module's own data must be above the window. Without
+     * -sGLOBAL_BASE=0x200000000 the segments land below 8 GB and the boot
+     * memset eats them, which is the wasm32 failure again at a different base.
+     * Refuse instead of continuing, because a wrong base is not a crash; it is
+     * a plausible guest address written somewhere else, discovered thousands of
+     * instructions later.
+     *
+     * vm_base's own address stands in for "the module's data": it is a global
+     * with a definition in the module, so it lives in the data or BSS segment
+     * and moves with the segments. That is exactly the thing the memset must
+     * not reach. */
+    if ((uintptr_t)&vm_base < end)
+        return CELL_ENOMEM;
+
+    vm_base = window;
+
+    /*
+     * No mprotect. Emscripten stubs __syscall_mprotect to "return 0; // let's
+     * not and say we did", so calling it here would report success having
+     * changed nothing -- and "success but nothing happened" is worse than a
+     * refusal, because the runtime never learns its protection model is gone.
+     * The two mprotect calls in the native paths below ask for read/write over
+     * main memory and the stack region, and linear memory is readable and
+     * writable throughout, so nothing is actually lost by not making them.
+     * vm__mprotect_pages() returns ENOSYS for the calls that would have
+     * mattered.
+     */
+  #endif
+#elif defined(_WIN32)
     /*
      * Reserve a contiguous 4 GB region.  We only commit pages as needed.
      * MEM_RESERVE just reserves address space without backing pages.
@@ -285,7 +423,12 @@ static inline void vm_shutdown(void)
 {
     if (!vm_base) return;
 
-#ifdef _WIN32
+#if defined(__EMSCRIPTEN__)
+    /* Nothing to release: the window is a constant address inside the module's
+     * own linear memory, and munmap would fail on it anyway (Emscripten's munmap
+     * only accepts addresses it handed out itself, and then only the exact
+     * length). Clearing the pointer is the whole teardown. */
+#elif defined(_WIN32)
     VirtualFree(vm_base, 0, MEM_RELEASE);
 #else
     munmap(vm_base, (size_t)VM_TOTAL_SIZE);
@@ -303,7 +446,23 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
     if (!VM_READY) return CELL_EFAULT;
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
 
-#ifdef _WIN32
+#if defined(__EMSCRIPTEN__)
+    /*
+     * Committing is a no-op here, and unlike the mprotect no-op that is the
+     * truth rather than a polite fiction: linear memory is readable and
+     * writable at every address for the module's whole life, so a range that
+     * is asked to become read/write already is. Bounds are the only thing that
+     * can be wrong, and vm_init() has already checked that the whole guest
+     * space lies inside linear memory.
+     *
+     * Deliberately not routed through vm__mprotect_pages(), which refuses under
+     * Emscripten because a caller there would be lied to. sys_memory_allocate
+     * and sys_mmapper_search_and_map run through this function; answering them
+     * ENOMEM would fail every allocation the guest ever makes, for a reason
+     * that is not true.
+     */
+    return ((uint64_t)addr + size <= (uint64_t)VM_TOTAL_SIZE) ? CELL_OK : CELL_ENOMEM;
+#elif defined(_WIN32)
     if (!VirtualAlloc(vm_base + addr, size, MEM_COMMIT, PAGE_READWRITE))
         return CELL_ENOMEM;
 #else
@@ -319,7 +478,22 @@ static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int wri
     if (!VM_READY) return CELL_EFAULT;
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
 
-#ifdef _WIN32
+#if defined(__EMSCRIPTEN__)
+    /*
+     * Ask for read/write and you get it, because it was already so. Ask for
+     * anything narrower and this refuses, because Emscripten cannot narrow it.
+     *
+     * The caller that matters is vm_stack_allocate(), which protects each new
+     * guest stack's guard page. Under Emscripten those guards do not exist and
+     * cannot: a stack overflow runs into the page below it instead of faulting.
+     * Saying so is the point -- the previous behaviour was mprotect returning 0
+     * for a stub that never implemented the syscall, so the guard page looked
+     * armed and the overflow was discovered as guest state quietly rewritten.
+     */
+    (void)addr;
+    if (read && write && !exec) return CELL_OK;
+    return CELL_EFAULT;
+#elif defined(_WIN32)
     DWORD prot = PAGE_NOACCESS;
     if (read && write && exec) prot = PAGE_EXECUTE_READWRITE;
     else if (read && write)    prot = PAGE_READWRITE;

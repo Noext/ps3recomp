@@ -331,39 +331,129 @@ static void decode_src(u32 w, int abs_bit, Src* s)
     s->swz[4] = '\0';
 }
 
+/* ---------------------------------------------------------------------------
+ * Output dialect
+ *
+ * rsx_fp_decompile_internal is parameterised by the text it emits. HLSL is
+ * what the D3D12 backend compiles and what the Vulkan and Metal backends
+ * lower through glslang; WGSL is what WebGPU consumes, and WebGPU has no
+ * HLSL front end at all, so the choice is between compiling glslang (a C++
+ * toolchain) and naga (a Rust toolchain) into the page, or teaching these
+ * emitters the second dialect. The second is smaller, and it is *only format
+ * strings*: the decode loop, the register model, the flow-control
+ * reconstruction and every semantic decision above are shared, and only the
+ * spelling changes.
+ *
+ * What actually differs, all of it syntax rather than semantics:
+ *
+ *   float4(x) / (float4)x        ->  vec4<f32>(x)
+ *   saturate(v)                  ->  clamp(v, vec4<f32>(0.0), vec4<f32>(1.0))
+ *   a ? b : c with a vector a    ->  select(b, c, a). WGSL's conditional takes
+ *                                   a scalar condition only, and every use
+ *                                   here is the componentwise NV40 write
+ *                                   mask, which is exactly select.
+ *   (a < b) cast to float4       ->  select(vec4<f32>(0.0), vec4<f32>(1.0),
+ *                                    a < b), because a WGSL comparison
+ *                                   produces vec4<bool>.
+ *   dst.xyzw = v.xyzw            ->  one statement per component: WGSL has no
+ *                                   swizzle assignment, and naga says so by
+ *                                   name ("WGSL does not support assignments
+ *                                   to swizzles").
+ *   lerp / frac / rsqrt / asfloat ->  mix / fract / inverseSqrt /
+ *                                   bitcast<f32>.
+ *   [unroll] for (i...) zero init ->  nothing: a WGSL var starts zeroed.
+ *   half-precision packs          ->  pack2x16float / unpack2x16float, which
+ *                                   are core WGSL; asuint/f16tof32 are not.
+ *   Texture2D rsx_tex[16]        ->  one binding per *used* unit. An array of
+ *                                   textures is not core WGSL (it needs the
+ *                                   wgpu_binding_array extension, which naga
+ *                                   enables for SPIR-V input, and a WebGPU
+ *                                   pipeline cannot bind a texture array
+ *                                   through a default layout anyway).
+ *   register(tN)/register(bN)    ->  @group(0) @binding(N), with the same
+ *                                   numbers the Vulkan path uses so one
+ *                                   binding table describes both.
+ *
+ * The HLSL arms are not touched by this: each WGSL expression sits in its own
+ * switch, so the text the D3D12, MSL and SPIR-V paths compile is physically
+ * the same bytes it was. tests/test_fp_wgsl.c diffs the HLSL of a whole
+ * opcode corpus against a golden copy precisely to keep it that way.
+ * ------------------------------------------------------------------------- */
+typedef enum {
+    RSX_FP_DIALECT_HLSL = 0,
+    RSX_FP_DIALECT_WGSL = 1
+} Dialect;
+
+/* WGSL float literals need a decimal point or an exponent. %g prints "1", and
+ * vec4<f32>(1, 2, 3, 4) is accepted at all only through abstract-int
+ * conversion, which does not apply to a constant arriving from elsewhere. */
+static void wgsl_f32(char* buf, u32 bufsz, double v)
+{
+    snprintf(buf, bufsz, "%.9g", v);
+    if (!strpbrk(buf, ".eEnN")) {
+        const size_t n = strlen(buf);
+        if (n + 3 <= bufsz) { buf[n] = '.'; buf[n + 1] = '0'; buf[n + 2] = '\0'; }
+    }
+}
+
+/* Write mask -> the store(s). Both dialects spell a masked store the same
+ * way; the difference is that HLSL also has dst.xyzw = v.xyzw and WGSL does
+ * not, so this is the one path both use. */
+static void emit_component_store(char* buf, u32 bufsz, const char* indent,
+                                 const char* dst, const char* mask,
+                                 const char* value)
+{
+    u32 used = 0;
+    buf[0] = '\0';
+    for (const char* c = mask; *c; c++) {
+        const int n = snprintf(buf + used, bufsz - used, "%s%s.%c = %s.%c;\n",
+                               indent, dst, *c, value, *c);
+        if (n < 0 || (u32)n >= bufsz - used) { buf[used] = '\0'; return; }
+        used += (u32)n;
+    }
+}
+
 /* HLSL expression for the interpolated input selected by OPDEST.INPUT_SRC.
  * The backend's passthrough VS forwards COL0/COL1/FOG/TEXCOORD0..7; WPOS maps
  * to SV_POSITION (screen-space — an approximation of the RSX window coord). */
-static const char* input_expr(u32 input_src)
+static const char* input_expr(u32 input_src, Dialect d)
 {
     static const char* tc[8] = {
         "input.tc0", "input.tc1", "input.tc2", "input.tc3",
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
+    const int wgsl = d == RSX_FP_DIALECT_WGSL;
     switch (input_src) {
     case 0x0: return "_rsx_wpos(input.position)"; /* WPOS (window origin applied below) */
     /* RSX clamps fragment color-input reads before swizzle/abs/negate.
-     * Texture coordinates and the vertex output registers remain unbounded. */
-    case 0x1: return "saturate(input.col0)"; /* COL0 */
-    case 0x2: return "saturate(input.col1)"; /* COL1 */
+     * Texture coordinates and the vertex output registers remain unbounded.
+     * WGSL has no saturate(); the preamble's _rsx_sat is that same clamp. */
+    case 0x1: return wgsl ? "_rsx_sat(input.col0)" : "saturate(input.col0)"; /* COL0 */
+    case 0x2: return wgsl ? "_rsx_sat(input.col1)" : "saturate(input.col1)"; /* COL1 */
     case 0x3: return "input.fog";      /* FOGC */
     case 0xC: return "input.tc8";      /* TC8 (VP o15) */
     case 0xD: return "input.tc9";      /* TC9 (VP o6) */
     /* FACING: +1 on a front face, -1 on a back face (RPCS3's `ssa`). Two-sided
      * materials multiply the interpolated normal by it; read as zero, inFAMOUS
      * 2's foliage and character heads normalised a null vector into the
-     * G-buffer and lit black. */
-    case 0xE: return "(input._rsx_front ? float4(1,1,1,1) : float4(-1,-1,-1,-1))";
+     * G-buffer and lit black. A WGSL conditional takes a scalar condition, so
+     * the same choice is spelled select(back, front, flag). */
+    case 0xE: return wgsl
+        ? "select(vec4<f32>(-1.0,-1.0,-1.0,-1.0), vec4<f32>(1.0,1.0,1.0,1.0), input._rsx_front)"
+        : "(input._rsx_front ? float4(1,1,1,1) : float4(-1,-1,-1,-1))";
     default:
         if (input_src >= 0x4 && input_src <= 0xB) return tc[input_src - 0x4]; /* TC0..7 */
-        return "float4(0,0,0,0)";
+        return wgsl ? "vec4<f32>(0.0,0.0,0.0,0.0)" : "float4(0,0,0,0)";
     }
 }
 
-/* Build the swizzled/negated/abs'd HLSL for one source into `buf`. */
+/* Build the swizzled/negated/abs'd source expression into buf, in the
+ * caller's dialect. */
 static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int has_k,
-                     int buffered, u32 constant_slot, char* buf, u32 bufsz)
+                     int buffered, u32 constant_slot, Dialect d,
+                     char* buf, u32 bufsz)
 {
-    char base[96];
+    const int wgsl = d == RSX_FP_DIALECT_WGSL;
+    char base[128];
     if (s->type == FP_REG_TYPE_TEMP) {
         snprintf(base, sizeof(base), "%s[%u]", s->half ? "h" : "r", s->index);
     } else if (s->type == FP_REG_TYPE_INPUT) {
@@ -374,21 +464,35 @@ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int
          * and read raw it lands far outside the copy and the river is black. */
         if (persp && input_src >= 0x4 && input_src <= 0xD)
             snprintf(base, sizeof(base), "(%s * _rsx_inv_w(input.position))",
-                     input_expr(input_src));
+                     input_expr(input_src, d));
         else
-            snprintf(base, sizeof(base), "%s", input_expr(input_src));
+            snprintf(base, sizeof(base), "%s", input_expr(input_src, d));
     } else { /* CONST */
+        /* The WGSL uniform block is a struct, so the constant bank is reached
+         * through it; HLSL's cbuffer puts the members in global scope. */
         if (buffered && has_k)
-            snprintf(
-                base, sizeof(base), "fp_constants[%u]", constant_slot);
-        else if (has_k)
-            snprintf(base, sizeof(base), "float4(%g,%g,%g,%g)",
-                     k[0], k[1], k[2], k[3]);
-        else
-            snprintf(base, sizeof(base), "float4(0,0,0,0)");
+            snprintf(base, sizeof(base), wgsl ? "ps.fp_constants[%u]"
+                                              : "fp_constants[%u]", constant_slot);
+        else if (has_k) {
+            if (wgsl) {
+                /* %.9g of a float never exceeds 16 characters, so four of them
+                 * and the punctuation fit in base; the separate array exists
+                 * only to add the decimal point WGSL requires. */
+                char c[4][24];
+                for (int i = 0; i < 4; i++) wgsl_f32(c[i], sizeof c[i], k[i]);
+                snprintf(base, sizeof(base), "vec4<f32>(%s,%s,%s,%s)",
+                         c[0], c[1], c[2], c[3]);
+            } else {
+                snprintf(base, sizeof(base), "float4(%g,%g,%g,%g)",
+                         k[0], k[1], k[2], k[3]);
+            }
+        } else {
+            snprintf(base, sizeof(base), wgsl ? "vec4<f32>(0.0,0.0,0.0,0.0)"
+                                              : "float4(0,0,0,0)");
+        }
     }
 
-    char swz[160];
+    char swz[200];
     snprintf(swz, sizeof(swz), "(%s).%s", base, s->swz);
 
     const char* pre = "";
@@ -618,10 +722,170 @@ static void fp_expand_helper(Out* out)
         "                  (mask & 8u) ? e.a : v.a);\n}\n");
 }
 
+
+/* ---------------------------------------------------------------------------
+ * WGSL helper preambles
+ *
+ * Each of these is the WGSL twin of an HLSL helper the preamble already emits
+ * for the same metadata (shadow comparison, gamma, sign expansion, NV40
+ * pack/unpack). They are separate functions rather than a parameterised one
+ * for the same reason the opcode tables are: the HLSL text has to stay
+ * byte-identical for the D3D12, MSL and SPIR-V paths, and it is easier to see
+ * that it did when the two spellings sit next to each other.
+ *
+ * Everything below is core WGSL. Nothing here needs an extension.
+ * ------------------------------------------------------------------------- */
+
+static void wgsl_gamma_helper(Out* out)
+{
+    out_puts(out,
+        "fn _rsx_gamma_input(v: vec4<f32>, mask: u32) -> vec4<f32> {\n"
+        "    let lo = v / vec4<f32>(12.92);\n"
+        "    let hi = pow(max((v + vec4<f32>(0.055)) / vec4<f32>(1.055),"
+        " vec4<f32>(0.0)), vec4<f32>(2.4));\n"
+        "    let decoded = select(lo, hi, v > vec4<f32>(0.04045));\n"
+        "    return select(v, decoded, vec4<bool>((mask & 1u) != 0u, (mask & 2u) != 0u,\n"
+        "                                        (mask & 4u) != 0u, (mask & 8u) != 0u));\n"
+        "}\n");
+}
+
+static void wgsl_expand_helper(Out* out)
+{
+    out_puts(out,
+        "fn _rsx_expand_input(v: vec4<f32>, mask: u32, bx2: bool) -> vec4<f32> {\n"
+        "    var e: vec4<f32>;\n"
+        "    if bx2 {\n"
+        "        e = v * vec4<f32>(2.0) - vec4<f32>(1.0);\n"
+        "    } else if (mask & 16u) != 0u {\n"
+        "        e = (round(v * vec4<f32>(65535.0)) - vec4<f32>(32768.0)) / vec4<f32>(32767.0);\n"
+        "    } else {\n"
+        "        e = (round(v * vec4<f32>(255.0)) - vec4<f32>(128.0)) / vec4<f32>(127.0);\n"
+        "    }\n"
+        "    return select(v, e, vec4<bool>((mask & 1u) != 0u, (mask & 2u) != 0u,\n"
+        "                                   (mask & 4u) != 0u, (mask & 8u) != 0u));\n"
+        "}\n");
+}
+
+/* NV40 pack/unpack. A packed word travels in a float's bits, which WGSL
+ * spells bitcast<f32>/bitcast<u32>; the 16-bit half forms are WGSL's core
+ * pack2x16float/unpack2x16float, the exact pair HLSL calls
+ * f32tof16/f16tof32. The sRGB forms follow RPCS3's _builtin_pkg/_builtin_upg
+ * (linear_to_srgb, srgb_to_linear), as the HLSL twin does. */
+static void wgsl_pack_helper(Out* out)
+{
+    out_puts(out,
+        "fn _rsx_pk4ub(v: vec4<f32>) -> u32 {\n"
+        "    let b = vec4<u32>(round(clamp(v, vec4<f32>(0.0), vec4<f32>(1.0))"
+        " * vec4<f32>(255.0)));\n"
+        "    return b.x | (b.y << 8u) | (b.z << 16u) | (b.w << 24u);\n"
+        "}\n"
+        "fn _rsx_up4ub(v: f32) -> vec4<f32> {\n"
+        "    let u = bitcast<u32>(v);\n"
+        "    return vec4<f32>(f32(u & 255u), f32((u >> 8u) & 255u),\n"
+        "                     f32((u >> 16u) & 255u), f32((u >> 24u) & 255u))"
+        " / vec4<f32>(255.0);\n"
+        "}\n"
+        "fn _rsx_pk4b(v: vec4<f32>) -> u32 {\n"
+        "    let c = vec4<i32>(round(clamp(v, vec4<f32>(-1.0), vec4<f32>(1.0))"
+        " * vec4<f32>(127.0)));\n"
+        "    let b = vec4<u32>(c) & vec4<u32>(255u);\n"
+        "    return b.x | (b.y << 8u) | (b.z << 16u) | (b.w << 24u);\n"
+        "}\n"
+        "fn _rsx_up4b(v: f32) -> vec4<f32> {\n"
+        "    let u = bitcast<u32>(v);\n"
+        "    var b: vec4<i32> = vec4<i32>(i32(u & 255u), i32((u >> 8u) & 255u),\n"
+        "                                 i32((u >> 16u) & 255u), i32((u >> 24u) & 255u));\n"
+        /* WGSL requires the shift amount to be unsigned even when the
+         * left operand is signed, so the 24-bit sign extension shifts
+         * by a vec4<u32>. HLSL accepts a signed literal here. */
+        "    b = (b << vec4<u32>(24u)) >> vec4<u32>(24u);\n"
+        "    return clamp(vec4<f32>(b) / vec4<f32>(127.0),"
+        " vec4<f32>(-1.0), vec4<f32>(1.0));\n"
+        "}\n"
+        "fn _rsx_pk2us(v: vec4<f32>) -> u32 {\n"
+        "    let b = vec2<u32>(round(clamp(v.xy, vec2<f32>(0.0), vec2<f32>(1.0))"
+        " * vec2<f32>(65535.0)));\n"
+        "    return b.x | (b.y << 16u);\n"
+        "}\n"
+        "fn _rsx_up2us(v: f32) -> vec4<f32> {\n"
+        "    let u = bitcast<u32>(v);\n"
+        "    return vec4<f32>(f32(u & 65535u), f32(u >> 16u),\n"
+        "                     f32(u & 65535u), f32(u >> 16u)) / vec4<f32>(65535.0);\n"
+        "}\n"
+        "fn _rsx_up2h(v: f32) -> vec4<f32> {\n"
+        "    let u = bitcast<u32>(v);\n"
+        "    let lo = unpack2x16float(u).x;\n"
+        "    let hi = unpack2x16float(u >> 16u).x;\n"
+        "    return vec4<f32>(lo, hi, lo, hi);\n"
+        "}\n"
+        "fn _rsx_lin2srgb(cl: vec4<f32>) -> vec4<f32> {\n"
+        "    let c = clamp(cl, vec4<f32>(0.0), vec4<f32>(1.0));\n"
+        "    let low = c * vec4<f32>(12.92);\n"
+        "    let high = vec4<f32>(1.055) * pow(c, vec4<f32>(1.0 / 2.4))"
+        " - vec4<f32>(0.055);\n"
+        "    return clamp(select(high, low, c < vec4<f32>(0.0031308)),"
+        " vec4<f32>(0.0), vec4<f32>(1.0));\n"
+        "}\n"
+        "fn _rsx_srgb2lin(cs: vec4<f32>) -> vec4<f32> {\n"
+        "    let a = cs / vec4<f32>(12.92);\n"
+        "    let b = pow(max(cs + vec4<f32>(0.055), vec4<f32>(0.0))"
+        " / vec4<f32>(1.055), vec4<f32>(2.4));\n"
+        "    return select(a, b, cs > vec4<f32>(0.04045));\n"
+        "}\n");
+}
+
+/* Shadow comparison. The RSX compares the stored depth with the reference
+ * (depth FUNC reference), the reverse of ARB_shadow's order -- see
+ * docs/SHADOW_COMPARISON.md. The fetch is the only part whose shape differs:
+ * textureSampleLevel takes the sampler second, and the dimensions come from
+ * textureDimensions rather than GetDimensions. */
+static void wgsl_shadow_helper(Out* p, u32 unit, const rsx_fp_shadow_desc* d)
+{
+    static const char* cmp[] = {
+        "false", "depth < reference", "depth == reference", "depth <= reference",
+        "depth > reference", "depth != reference", "depth >= reference", "true" };
+    char text[4096];
+    snprintf(text, sizeof text,
+        "fn _rsx_shadow_cmp%u(reference: f32, depth: f32) -> f32 {"
+        " return select(0.0, 1.0, %s); }\n"
+        "fn _rsx_shadow%u(coordinate: vec3<f32>) -> vec4<f32> {\n"
+        "    let reference = clamp(coordinate.z, 0.0, 1.0);\n",
+        unit, cmp[d->func], unit);
+    out_puts(p, text);
+    snprintf(text, sizeof text,
+             "    let size = vec2<f32>(textureDimensions(rsx_tex%u));\n", unit);
+    if (d->linear || d->unnormalized) out_puts(p, text);
+    out_puts(p, d->unnormalized
+        ? "    let uv = coordinate.xy / size;\n"
+        : "    let uv = coordinate.xy;\n");
+    if (!d->linear) {
+        snprintf(text, sizeof text,
+            "    let depth = textureSampleLevel(rsx_tex%u, rsx_samp%u, uv, 0.0).r;\n"
+            "    return vec4<f32>(_rsx_shadow_cmp%u(reference, depth));\n}\n",
+            unit, unit, unit);
+        out_puts(p, text);
+        return;
+    }
+    out_puts(p, "    let position = uv * size - vec2<f32>(0.5);\n"
+                "    let base = floor(position);\n"
+                "    let fraction = position - base;\n");
+    for (u32 tap = 0; tap < 4; tap++) {
+        snprintf(text, sizeof text,
+            "    let d%u = textureSampleLevel(rsx_tex%u, rsx_samp%u,"
+            " (base + vec2<f32>(%s, %s)) / size, 0.0).r;\n"
+            "    let c%u = _rsx_shadow_cmp%u(reference, d%u);\n",
+            tap, unit, unit, (tap & 1) ? "1.5" : "0.5", (tap & 2) ? "1.5" : "0.5",
+            tap, unit, tap);
+        out_puts(p, text);
+    }
+    out_puts(p, "    return vec4<f32>(mix(mix(c0, c1, fraction.x),"
+                " mix(c2, c3, fraction.x), fraction.y));\n}\n");
+}
+
 static int rsx_fp_decompile_internal(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 tex_vol_mask,
     int buffered, const rsx_fp_shadow_desc* shadow, const u8 gamma_masks[16],
-    const u8* expand_masks,
+    const u8* expand_masks, Dialect dialect,
     char* out, u32 out_size, u32* out_constant_count)
 {
     if (!ucode || !out || out_size == 0) return -1;
@@ -664,19 +928,31 @@ static int rsx_fp_decompile_internal(
      * is a struct as soon as the program turns out to write a second colour
      * export -- which is only known once every instruction has been decoded.
      * Emitting the preamble here would mean guessing it. */
+    const int wgsl = dialect == RSX_FP_DIALECT_WGSL;
     Out o = { out, out_size, 0, 1 };
     out[0] = '\0';
     int uses_pack = 0;   /* a pack or unpack opcode was decoded: the preamble gets its helpers */
-    out_puts(&o,
-        "    float4 r[48]; float4 h[48];\n"
-        /* Fully initialise both register files: RSX programs routinely read a
-         * register lane before writing it (the hardware reads undefined), but
-         * HLSL rejects use-before-init (error X4000). Zero everything. */
-        "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n"
-        /* Condition-code registers for exec_if predication / set_cond. Reset
-         * to 0 (NV40 CC power-up state). Dead in non-predicated programs. */
-        "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n");
-    /* RSX_FP_DEBUG=<structural hash hex>:<n>:<reg[.swz]>: in the program
+    if (wgsl)
+        out_puts(&o,
+            "    var r: array<vec4<f32>, 48>;\n"
+            "    var h: array<vec4<f32>, 48>;\n"
+            /* A WGSL local var is zero-initialised before any statement runs,
+             * so the unrolled HLSL loop has no counterpart. It would also
+             * index a local array with a runtime value, which naga rejects
+             * unless the index is provably in bounds; the initialiser is the
+             * only reason that loop exists. */
+            "    var cc0 = vec4<f32>(0.0, 0.0, 0.0, 0.0);\n"
+            "    var cc1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);\n");
+    else
+        out_puts(&o,
+            "    float4 r[48]; float4 h[48];\n"
+            /* Fully initialise both register files: RSX programs routinely read a
+             * register lane before writing it (the hardware reads undefined), but
+             * HLSL rejects use-before-init (error X4000). Zero everything. */
+            "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n"
+            /* Condition-code registers for exec_if predication / set_cond. Reset
+             * to 0 (NV40 CC power-up state). Dead in non-predicated programs. */
+            "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n");    /* RSX_FP_DEBUG=<structural hash hex>:<n>:<reg[.swz]>: in the program
      * with that structural hash (rsx_fp_structural_hash with the FNV offset
      * basis as seed, the "fp" the engine's pipeline log and shader dump
      * print), copy register <reg> (r3, h1, h1.wwww ...) right after its
@@ -802,15 +1078,15 @@ static int rsx_fp_decompile_internal(
          * (RPCS3 RSXFragmentProgram.h SRC2); on a branch the word is an
          * address instead. */
         const int persp = !is_branch && (w3 >> 31) != 0;
-        char a[200], b[200], c[200];
+        char a[256], b[256], c[256];
         emit_src(
-            &s0, input_src, persp, k, has_k, buffered, constant_slot,
+            &s0, input_src, persp, k, has_k, buffered, constant_slot, dialect,
             a, sizeof(a));
         emit_src(
-            &s1, input_src, persp, k, has_k, buffered, constant_slot,
+            &s1, input_src, persp, k, has_k, buffered, constant_slot, dialect,
             b, sizeof(b));
         emit_src(
-            &s2, input_src, persp, k, has_k, buffered, constant_slot,
+            &s2, input_src, persp, k, has_k, buffered, constant_slot, dialect,
             c, sizeof(c));
         if (has_k)
             constant_slot++;
@@ -890,9 +1166,173 @@ static int rsx_fp_decompile_internal(
             out_puts(&o, line);
             dbg_done = 1;
         }
-        /* Build the RHS expression for this opcode. */
-        char rhs[640];
+        /* Build the RHS expression for this opcode.
+         *
+         * The WGSL arm is a second switch on the same opcode, not a
+         * transtyped HLSL string, so each dialect reads next to its origin
+         * and the HLSL text is untouched. Every difference is spelling:
+         *
+         *   - saturate/lerp/frac/rsqrt/asfloat/asuint/f32tof16/f16tof32 do
+         *     not exist in WGSL; clamp/mix/fract/inverseSqrt/bitcast<>/
+         *     pack2x16float/unpack2x16float are the same operations.
+         *   - a comparison yields vec4<bool>, so the set-on-compare opcodes
+         *     compare and select rather than cast a bool vector to float.
+         *   - a vector conditional is select(false_value, true_value, cond);
+         *     WGSL's conditional operator takes a scalar condition only.
+         *   - Sample/SampleLevel/SampleBias are textureSample,
+         *     textureSampleLevel and textureSampleBias, taking the sampler
+         *     after the texture rather than before the coordinate.
+         *   - the texture bank is one binding per unit (rsx_tex0 ...). A WGSL
+         *     array of textures needs wgpu_binding_array, which is not core
+         *     WGSL, and a WebGPU pipeline cannot bind a texture array through
+         *     a default layout anyway.
+         */
+        char rhs[1024];
         int handled = 1;
+        if (wgsl) {
+            /* Cube, volume and plain 2D units all sample through their own
+             * binding; only the coordinate width differs. */
+            const int cube = (int)((tex_sep_mask >> tex_unit) & 1u);
+            switch (opcode) {
+            case OP_NOP: rhs[0] = '\0'; handled = 0; break;
+            case OP_MOV: snprintf(rhs, sizeof(rhs), "%s", a); break;
+            case OP_MUL: snprintf(rhs, sizeof(rhs), "(%s) * (%s)", a, b); break;
+            case OP_ADD: snprintf(rhs, sizeof(rhs), "(%s) + (%s)", a, b); break;
+            case OP_MAD: snprintf(rhs, sizeof(rhs), "(%s) * (%s) + (%s)", a, b, c); break;
+            case OP_DP3: snprintf(rhs, sizeof(rhs), "dot((%s).xyz, (%s).xyz)", a, b); break;
+            case OP_DP4: snprintf(rhs, sizeof(rhs), "dot((%s), (%s))", a, b); break;
+            case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
+            case OP_MIN: snprintf(rhs, sizeof(rhs), "min((%s), (%s))", a, b); break;
+            case OP_MAX: snprintf(rhs, sizeof(rhs), "max((%s), (%s))", a, b); break;
+            case OP_FRC: snprintf(rhs, sizeof(rhs), "fract(%s)", a); break;
+            case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
+            case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
+            /* RSQ ignores the input's sign, as the HLSL arm explains: the RSX
+             * hardware does, and the strict form NaN'd normal-map
+             * Z-reconstruction in inFAMOUS 2. */
+            case OP_RSQ: snprintf(rhs, sizeof(rhs), "inverseSqrt(abs((%s).x))", a); break;
+            case OP_EX2: snprintf(rhs, sizeof(rhs), "exp2((%s).x)", a); break;
+            case OP_LG2: snprintf(rhs, sizeof(rhs), "log2((%s).x)", a); break;
+            case OP_COS: snprintf(rhs, sizeof(rhs), "cos((%s).x)", a); break;
+            case OP_SIN: snprintf(rhs, sizeof(rhs), "sin((%s).x)", a); break;
+            case OP_POW: snprintf(rhs, sizeof(rhs), "pow((%s).x, (%s).x)", a, b); break;
+            case OP_DIV: snprintf(rhs, sizeof(rhs), "(%s) / (%s).x", a, b); break;
+            /* DIVSQ is zero wherever the NUMERATOR component is zero, even if
+             * the denominator is too. A select, never a mix: 0/0 is NaN and
+             * mixing would propagate it (the HLSL arm's comment says why). */
+            case OP_DIVSQ:
+                snprintf(rhs, sizeof(rhs),
+                         "select(vec4<f32>(0.0,0.0,0.0,0.0), (%s) / sqrt(abs((%s).x)),"
+                         " abs(%s) > vec4<f32>(0.0,0.0,0.0,0.0))",
+                         a, b, a);
+                break;
+            case OP_NRM: snprintf(rhs, sizeof(rhs), "vec4<f32>(normalize((%s).xyz), 1.0)", a); break;
+            case OP_LRP: snprintf(rhs, sizeof(rhs), "mix((%s), (%s), (%s))", c, b, a); break;
+            /* Lighting coefficients: (1, y, y > 0 ? 2^w : 0, 1). The lane
+             * conditional is scalar, so plain select(). */
+            case OP_LIF:
+                snprintf(rhs, sizeof(rhs),
+                         "vec4<f32>(1.0, (%s).y, select(0.0, exp2((%s).w), (%s).y > 0.0), 1.0)",
+                         a, a, a);
+                break;
+            case OP_FENCT: case OP_FENCB: rhs[0] = '\0'; handled = 0; break;
+            /* Set-on-compare: 1.0 where the test holds, 0.0 elsewhere. */
+            case OP_SLT: case OP_SGE: case OP_SLE: case OP_SGT:
+            case OP_SNE: case OP_SEQ: {
+                const char* op =
+                    opcode == OP_SLT ? "<"  : opcode == OP_SGE ? ">=" :
+                    opcode == OP_SLE ? "<=" : opcode == OP_SGT ? ">"  :
+                    opcode == OP_SNE ? "!=" : "==";
+                snprintf(rhs, sizeof(rhs),
+                         "select(vec4<f32>(0.0,0.0,0.0,0.0), vec4<f32>(1.0,1.0,1.0,1.0), (%s) %s (%s))",
+                         a, op, b);
+                break;
+            }
+            /* NV40 pack/unpack: a packed word travels in a float's bits, so
+             * the packs bitcast and the unpacks read the bits back. The
+             * 16-bit forms use WGSL's core pack2x16float/unpack2x16float,
+             * which is exactly HLSL's f32tof16/f16tof32 pair here. */
+            case OP_PK4UB: uses_pack = 1;
+                snprintf(rhs, sizeof(rhs), "bitcast<f32>(_rsx_pk4ub(%s))", a); break;
+            case OP_UP4UB: uses_pack = 1;
+                snprintf(rhs, sizeof(rhs), "_rsx_up4ub((%s).x)", a); break;
+            case OP_PKG: uses_pack = 1;
+                snprintf(rhs, sizeof(rhs), "bitcast<f32>(_rsx_pk4ub(_rsx_lin2srgb(%s)))", a); break;
+            case OP_UPG: uses_pack = 1;
+                snprintf(rhs, sizeof(rhs), "_rsx_srgb2lin(_rsx_up4ub((%s).x))", a); break;
+            case OP_PK4B: uses_pack = 1;
+                snprintf(rhs, sizeof(rhs), "bitcast<f32>(_rsx_pk4b(%s))", a); break;
+            case OP_UP4B: uses_pack = 1;
+                snprintf(rhs, sizeof(rhs), "_rsx_up4b((%s).x)", a); break;
+            case OP_PK2US: uses_pack = 1;
+                snprintf(rhs, sizeof(rhs), "bitcast<f32>(_rsx_pk2us(%s))", a); break;
+            case OP_UP2US: uses_pack = 1;
+                snprintf(rhs, sizeof(rhs), "_rsx_up2us((%s).x)", a); break;
+            case OP_PK2H: uses_pack = 1;
+                snprintf(rhs, sizeof(rhs), "bitcast<f32>(pack2x16float((%s).xy))", a); break;
+            case OP_UP2H: uses_pack = 1;
+                snprintf(rhs, sizeof(rhs), "_rsx_up2h((%s).x)", a); break;
+            case OP_TEX:
+                if (shadow && shadow[tex_unit].enabled) {
+                    snprintf(rhs, sizeof(rhs), "_rsx_shadow%u((%s).xyz)", tex_unit, a);
+                    break;
+                }
+                snprintf(rhs, sizeof(rhs), "textureSample(rsx_tex%u, rsx_samp%u, (%s).%s)",
+                         tex_unit, tex_unit, a, cube ? "xyz" : "xy");
+                break;
+            case OP_TXP:
+                if (shadow && shadow[tex_unit].enabled) {
+                    snprintf(rhs, sizeof(rhs), "_rsx_shadow%u((%s).xyz / (%s).w)",
+                             tex_unit, a, a);
+                    break;
+                }
+                /* Projective divide is meaningless for a cube lookup. */
+                if (cube)
+                    snprintf(rhs, sizeof(rhs),
+                             "textureSample(rsx_tex%u, rsx_samp%u, (%s).xyz)",
+                             tex_unit, tex_unit, a);
+                else
+                    snprintf(rhs, sizeof(rhs),
+                             "textureSample(rsx_tex%u, rsx_samp%u, (%s).%s / (%s).w)",
+                             tex_unit, tex_unit, a,
+                             ((tex_vol_mask >> tex_unit) & 1u) ? "xyz" : "xy", a);
+                break;
+            case OP_TXB: case OP_TXL:
+                /* Biased / explicit-LOD sample; the bias or LOD is src1.x. */
+                snprintf(rhs, sizeof(rhs),
+                         "%s(rsx_tex%u, rsx_samp%u, (%s).%s, (%s).x)",
+                         opcode == OP_TXB ? "textureSampleBias" : "textureSampleLevel",
+                         tex_unit, tex_unit, a, cube ? "xyz" : "xy", b);
+                break;
+            case OP_KIL:
+                /* Fragment kill, predicated by the same exec_if condition as
+                 * any other instruction (RPCS3 AddFlowOp("discard") under
+                 * GetCond()); a never-set condition emits nothing. */
+                if (is_never) {
+                    rhs[0] = '\0';
+                } else if (is_uncond) {
+                    out_puts(&o, "    discard;\n");
+                } else {
+                    char kil[160];
+                    snprintf(kil, sizeof(kil),
+                             "    if (any(cc%u.%s %s vec4<f32>(0.0,0.0,0.0,0.0))) { discard; }\n",
+                             cc_read, cswz, cmp_op);
+                    out_puts(&o, kil);
+                }
+                handled = 0;   /* no destination write */
+                break;
+            default: {
+                char todo[160];
+                snprintf(todo, sizeof todo,
+                         "    // TODO: unhandled FP opcode 0x%02X (%s) words %08X %08X %08X %08X\n",
+                         opcode, rsx_fp_opcode_name(opcode), w0, w1, w2, w3);
+                out_puts(&o, todo);
+                handled = 0;
+                break;
+            }
+            }
+        } else {
+        /* Build the RHS expression for this opcode. */
         switch (opcode) {
         case OP_NOP: rhs[0] = '\0'; handled = 0; break;
         case OP_MOV: snprintf(rhs, sizeof(rhs), "%s", a); break;
@@ -1047,6 +1487,7 @@ static int rsx_fp_decompile_internal(
             break; }
             break;
         }
+        }   /* dialect */
 
         if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
             (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
@@ -1108,17 +1549,69 @@ static int rsx_fp_decompile_internal(
              * vector rhs to its .x, but NV40 writes rhs.w to dst.w. Scalar
              * results (DPx/RCP/...) replicate, which is also the hardware
              * behavior. */
-            if (has_dest && is_uncond && !set_cond) {
+            if (wgsl) {
+                /* WGSL has no swizzle assignment, so a masked write is one
+                 * statement per lane. The result is bound once, exactly as the
+                 * HLSL arm's float4 _v does, so a lane expression with a side
+                 * effect (a texture fetch) still runs once. */
+                char buf[2048];
+                snprintf(buf, sizeof(buf),
+                         "    {\n      var _v = vec4<f32>(%s)%s;\n",
+                         rhs, scale_txt[res_scale]);
+                out_puts(&o, buf);
+                /* Saturate has no WGSL spelling; _rsx_sat is the preamble's
+                 * clamp, applied to the scaled result as the modifier order
+                 * requires. */
+                if (w0 & FP_OUT_SAT) out_puts(&o, "      _v = _rsx_sat(_v);\n");
+                char dst[40];
+                char buf2[1024];
+                snprintf(dst, sizeof dst, "%s[%u]", reg, dst_idx);
+                if (has_dest) {
+                    if (is_uncond) {
+                        emit_component_store(buf2, sizeof buf2, "      ", dst, m, "_v");
+                        out_puts(&o, buf2);
+                    } else if (is_never) {
+                        out_puts(&o, "      // exec_if=none: write suppressed\n");
+                    } else {
+                        /* Per-lane predicate. WGSL's conditional takes a
+                         * scalar, so each lane is tested separately; a
+                         * componentwise select would also be wrong for the
+                         * HLSL arm's reason -- the unselected operand may
+                         * hold a NaN or a raw packed word, and select
+                         * evaluates both. */
+                        snprintf(buf2, sizeof buf2,
+                                 "      let _p = (cc%u).%s %s vec4<f32>(0.0,0.0,0.0,0.0);\n",
+                                 cc_read, cswz, cmp_op);
+                        out_puts(&o, buf2);
+                        for (const char* c = m; *c; c++) {
+                            snprintf(buf2, sizeof buf2,
+                                     "      if (_p.%c) { %s.%c = _v.%c; }\n",
+                                     *c, dst, *c, *c);
+                            out_puts(&o, buf2);
+                        }
+                    }
+                }
+                if (set_cond) {
+                    char src[40];
+                    char ccd[8];
+                    if (has_dest) snprintf(src, sizeof src, "%s[%u]", reg, dst_idx);
+                    else          snprintf(src, sizeof src, "_v");
+                    snprintf(ccd, sizeof ccd, "cc%u", cc_write);
+                    emit_component_store(buf2, sizeof buf2, "      ", ccd, m, src);
+                    out_puts(&o, buf2);
+                }
+                out_puts(&o, "    }\n");
+            } else if (has_dest && is_uncond && !set_cond) {
                 /* Common unconditional path — kept byte-identical so the 39
                  * non-predicated programs in this capture emit unchanged. */
-                char line[800];
+                char line[1400];
                 snprintf(line, sizeof(line),
                          "    { float4 _v = (float4)(%s)%s;%s %s[%u].%s = _v.%s; }\n",
                          rhs, scale_txt[res_scale], sat, reg, dst_idx, m, m);
                 out_puts(&o, line);
             } else {
                 /* Predicated and/or CC-writing instruction. */
-                char buf[1200];
+                char buf[2000];
                 snprintf(buf, sizeof(buf),
                          "    { float4 _v = (float4)(%s)%s;%s\n",
                          rhs, scale_txt[res_scale], sat);
@@ -1219,8 +1712,15 @@ static int rsx_fp_decompile_internal(
                          " r[0] = _d; h[0] = _d; }\n");
     }
     if (targets == 1 && !depth_export) {
-        char tail[96];
+        char tail[256];
+        /* The NaN guard, per target. In WGSL it is a select: the conditional
+         * operator needs a scalar condition, and "x == x" is scalar for a
+         * vector comparison in WGSL -- so the guard asks whether the value is
+         * NaN as a whole, which is what the HLSL arm's (_o == _o) does too. */
         snprintf(tail, sizeof(tail),
+                 wgsl ?
+                 "    let _o = %s[0];\n"
+                 "    return select(vec4<f32>(0.0,0.0,0.0,0.0), _o, _o == _o);\n}\n" :
                  "    float4 _o = %s[0];\n"
                  "    return (_o == _o) ? _o : (float4)0;\n}\n", export_file);
         out_puts(&o, tail);
@@ -1228,10 +1728,14 @@ static int rsx_fp_decompile_internal(
         /* Multiple render targets. The NaN guard is per target: a poisoned
          * G-buffer plane is as fatal as a poisoned colour one, and the planes
          * are computed independently. */
-        out_puts(&o, "    PSOutput _out;\n");
+        out_puts(&o, wgsl ? "    var _out: PSOutput;\n"
+                          : "    PSOutput _out;\n");
         for (u32 t = 0; t < targets; t++) {
-            char line[192];
+            char line[400];
             snprintf(line, sizeof(line),
+                     wgsl ?
+                     "    let _o%u = %s[%u];\n"
+                     "    _out.t%u = select(vec4<f32>(0.0,0.0,0.0,0.0), _o%u, _o%u == _o%u);\n" :
                      "    float4 _o%u = %s[%u];\n"
                      "    _out.t%u = (_o%u == _o%u) ? _o%u : (float4)0;\n",
                      t, export_file, fp_export_reg[half_exports][t],
@@ -1239,8 +1743,11 @@ static int rsx_fp_decompile_internal(
             out_puts(&o, line);
         }
         if (depth_export)
-            out_puts(&o, "    float _d = r[1].z;\n"
-                         "    _out.depth = (_d == _d) ? saturate(_d) : 0.0;\n");
+            out_puts(&o, wgsl ?
+                "    let _d = r[1].z;\n"
+                "    _out.depth = select(0.0, _rsx_sat(vec4<f32>(_d)).x, _d == _d);\n" :
+                "    float _d = r[1].z;\n"
+                "    _out.depth = (_d == _d) ? saturate(_d) : 0.0;\n");
         out_puts(&o, "    return _out;\n}\n");
     }
 
@@ -1250,6 +1757,96 @@ static int rsx_fp_decompile_internal(
     char preamble[32768]; /* bounded room for all 16 comparison helpers */
     Out p = { preamble, sizeof(preamble), 0, 1 };
     preamble[0] = '\0';
+    if (wgsl) {
+        /* ---- WGSL preamble ------------------------------------------------
+         * A WGSL fragment stage declares its inputs by attribute, not by a
+         * struct the host fills, so PSInput is a real struct with @location
+         * attributes. Locations follow the HLSL declaration order the MSL and
+         * SPIR-V paths already agree on (TProgram::mapIO), which is what keeps
+         * the vertex and fragment stages linking across all three backends:
+         * col0/col1/fog/tc0..tc7 are locations 0..10, tc8/tc9 follow at
+         * 11/12. Every input is declared unconditionally, exactly as the HLSL
+         * arm does, because a WebGPU pipeline's vertex layout is built from
+         * the shader's declared inputs and a stage that declares fewer than
+         * the vertex stage writes is a validation error at pipeline build.
+         */
+        out_puts(&p,
+            "struct PSInput {\n"
+            "    @builtin(position) position: vec4<f32>,\n"
+            "    @location(0) col0: vec4<f32>,\n"
+            "    @location(1) col1: vec4<f32>,\n"
+            "    @location(2) fog: vec4<f32>,\n");
+        for (u32 i = 0; i < 8; i++) {
+            char line[64];
+            snprintf(line, sizeof line, "    @location(%u) tc%u: vec4<f32>,\n", 3u + i, i);
+            out_puts(&p, line);
+        }
+        out_puts(&p,
+            "    @location(11) tc8: vec4<f32>,\n"
+            "    @location(12) tc9: vec4<f32>,\n"
+            "    @builtin(front_facing) _rsx_front: bool,\n"
+            "};\n");
+        /* 1/w. WebGPU's @builtin(position).w is already 1/w (it is the same
+         * value Vulkan's FragCoord.w carries), which is what the HLSL arm's
+         * RSX_FRAGCOORD_W_IS_RCP selects -- so no #define is needed here. */
+        if (strstr(o.p, "_rsx_inv_w("))
+            out_puts(&p, "fn _rsx_inv_w(p: vec4<f32>) -> f32 { return p.w; }\n");
+        /* WPOS in the RSX window convention, as the HLSL arm's _rsx_wpos
+         * macro computes it: fp_alpha.y is the window height when the origin
+         * is BOTTOM, fp_alpha.z the pixel-center bias. */
+        if (strstr(o.p, "_rsx_wpos("))
+            out_puts(&p, buffered
+                ? "fn _rsx_wpos(p: vec4<f32>) -> vec4<f32> {\n"
+                  "    return vec4<f32>(p.x + ps.fp_alpha.z,\n"
+                  "        select(p.y, ps.fp_alpha.y - p.y, ps.fp_alpha.y != 0.0) + ps.fp_alpha.z,\n"
+                  "        p.z, p.w);\n"
+                  "}\n"
+                : "fn _rsx_wpos(p: vec4<f32>) -> vec4<f32> { return p; }\n");
+        /* saturate() is an HLSL intrinsic with no WGSL spelling. */
+        out_puts(&p,
+            "fn _rsx_sat(v: vec4<f32>) -> vec4<f32> {\n"
+            "    return clamp(v, vec4<f32>(0.0,0.0,0.0,0.0), vec4<f32>(1.0,1.0,1.0,1.0));\n"
+            "}\n");
+        /* Bindings. The numbers are rsx_shader_spirv.h's, so one binding table
+         * describes the Vulkan and WebGPU paths: b0/b1 constants at 0/1,
+         * t0..t15 at 16..31, s0..s15 at 48..63. Only units this program
+         * actually samples are declared, because a WGSL binding that is never
+         * used is still part of the pipeline layout the backend has to
+         * satisfy and WebGPU has no equivalent of an unused SRV slot.
+         *
+         * A texture bank cannot be a WGSL array: texture arrays are an
+         * extension (wgpu_binding_array) that a default pipeline layout
+         * cannot bind, so each used unit is its own binding. That is a
+         * backend-visible contract, not an implementation detail. */
+        for (u32 u = 0; u < 16; u++) {
+            if (!((sampled_units >> u) & 1u)) continue;
+            char decl[160];
+            const char* type =
+                ((tex_cube_mask >> u) & 1u) ? "texture_cube<f32>" :
+                ((tex_vol_mask >> u) & 1u)  ? "texture_3d<f32>" :
+                                              "texture_2d<f32>";
+            snprintf(decl, sizeof decl,
+                     "@group(0) @binding(%u) var rsx_tex%u: %s;\n",
+                     RSX_FP_WGSL_TEXTURE_BINDING + u, u, type);
+            out_puts(&p, decl);
+            snprintf(decl, sizeof decl,
+                     "@group(0) @binding(%u) var rsx_samp%u: sampler;\n",
+                     RSX_FP_WGSL_SAMPLER_BINDING + u, u);
+            out_puts(&p, decl);
+        }
+        if (buffered) {
+            char decl[256];
+            snprintf(decl, sizeof decl,
+                "struct PSConstants {\n"
+                "    fp_constants: array<vec4<f32>, %u>,\n"
+                "    fp_alpha: vec4<f32>,\n"
+                "};\n"
+                "@group(0) @binding(%u) var<uniform> ps: PSConstants;\n",
+                buffered_constant_count ? buffered_constant_count : 1u,
+                RSX_FP_WGSL_VPCONST_BINDING + 1u);
+            out_puts(&p, decl);
+        }
+    } else {
     out_puts(&p,
         "struct PSInput {\n"
         "    float4 position : SV_POSITION; float4 col0 : COLOR0; float4 col1 : COLOR1;\n"
@@ -1317,11 +1914,24 @@ static int rsx_fp_decompile_internal(
             buffered_constant_count ? buffered_constant_count : 1u);
         out_puts(&p, constants_decl);
     }
+    }   /* dialect: struct + binding declarations */
+
+    /* The helper preambles and the entry point are dialect-agnostic in shape:
+     * each branch picks the spelling, the decision of *whether* to emit one
+     * is shared. */
     if (shadow) for (u32 u = 0; u < 16; u++)
-        if ((sampled_units & (1u << u)) && shadow[u].enabled)
-            fp_shadow_helper(&p, u, tex_sep_mask, &shadow[u]);
-    if (gamma_units) fp_gamma_helper(&p);
-    if (expand_units || bx2_units) fp_expand_helper(&p);
+        if ((sampled_units & (1u << u)) && shadow[u].enabled) {
+            if (wgsl) wgsl_shadow_helper(&p, u, &shadow[u]);
+            else      fp_shadow_helper(&p, u, tex_sep_mask, &shadow[u]);
+        }
+    if (gamma_units) {
+        if (wgsl) wgsl_gamma_helper(&p);
+        else      fp_gamma_helper(&p);
+    }
+    if (expand_units || bx2_units) {
+        if (wgsl) wgsl_expand_helper(&p);
+        else      fp_expand_helper(&p);
+    }
     /* NV40 pack/unpack. A packed word travels on in a float's bits, so the
      * packs bitcast and the unpacks bitcast back; the sRGB forms follow
      * RPCS3's _builtin_pkg/_builtin_upg (linear_to_srgb, srgb_to_linear).
@@ -1329,7 +1939,8 @@ static int rsx_fp_decompile_internal(
      * decompiler skipped, leaving the destination with whatever it held.
      * Only for a program that uses one, so every other program's text is
      * unchanged. */
-    if (uses_pack) out_puts(&p,
+    if (uses_pack && wgsl) wgsl_pack_helper(&p);
+    else if (uses_pack) out_puts(&p,
         "uint   _rsx_pk4ub(float4 v) { uint4 b = (uint4)round(saturate(v) * 255.0); return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }\n"
         "float4 _rsx_up4ub(float v) { uint u = asuint(v); return float4(u & 255u, (u >> 8) & 255u, (u >> 16) & 255u, (u >> 24) & 255u) / 255.0; }\n"
         "uint   _rsx_pk4b(float4 v) { uint4 b = (uint4)((int4)round(clamp(v, -1.0, 1.0) * 127.0)) & 255u; return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }\n"
@@ -1340,7 +1951,23 @@ static int rsx_fp_decompile_internal(
         "float4 _rsx_up2h(float v) { uint u = asuint(v); return float4(f16tof32(u & 65535u), f16tof32(u >> 16), f16tof32(u & 65535u), f16tof32(u >> 16)); }\n"
         "float4 _rsx_lin2srgb(float4 cl) { cl = saturate(cl); float4 low = cl * 12.92; float4 high = 1.055 * pow(cl, 1.0 / 2.4) - 0.055; return saturate((cl < 0.0031308) ? low : high); }\n"
         "float4 _rsx_srgb2lin(float4 cs) { float4 a = cs / 12.92; float4 b = pow(max(cs + 0.055, 0.0) / 1.055, 2.4); return (cs > 0.04045) ? b : a; }\n");
-    if (targets == 1 && !depth_export) {
+    if (wgsl) {
+        if (targets == 1 && !depth_export) {
+            out_puts(&p, "@fragment\nfn main(input: PSInput) -> @location(0) vec4<f32> {\n");
+        } else {
+            out_puts(&p, "struct PSOutput {\n");
+            for (u32 t = 0; t < targets; t++) {
+                char member[64];
+                snprintf(member, sizeof(member),
+                         "    @location(%u) t%u: vec4<f32>,\n", t, t);
+                out_puts(&p, member);
+            }
+            if (depth_export)
+                out_puts(&p, "    @builtin(frag_depth) depth: f32,\n");
+            out_puts(&p, "};\n"
+                         "@fragment\nfn main(input: PSInput) -> PSOutput {\n");
+        }
+    } else if (targets == 1 && !depth_export) {
         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
     } else {
         out_puts(&p, "struct PSOutput {\n");
@@ -1367,7 +1994,8 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 0, 0, NULL, NULL, NULL, out, out_size, NULL);
+        ucode, max_bytes, ctrl, tex_cube_mask, 0, 0, NULL, NULL, NULL,
+        RSX_FP_DIALECT_HLSL, out, out_size, NULL);
 }
 
 int rsx_fp_decompile_buffered_ex(
@@ -1375,8 +2003,8 @@ int rsx_fp_decompile_buffered_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 0, 1, NULL, NULL, NULL, out, out_size,
-        out_constant_count);
+        ucode, max_bytes, ctrl, tex_cube_mask, 0, 1, NULL, NULL, NULL,
+        RSX_FP_DIALECT_HLSL, out, out_size, out_constant_count);
 }
 
 int rsx_fp_decompile_buffered_shadow_ex(
@@ -1385,7 +2013,8 @@ int rsx_fp_decompile_buffered_shadow_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask, 0,
-        1, shadow, NULL, NULL, out, out_size, out_constant_count);
+        1, shadow, NULL, NULL, RSX_FP_DIALECT_HLSL,
+        out, out_size, out_constant_count);
 }
 
 int rsx_fp_decompile_buffered_shadow_color_ex(
@@ -1394,7 +2023,8 @@ int rsx_fp_decompile_buffered_shadow_color_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask, 0,
-        1, shadow, gamma_masks, NULL, out, out_size, out_constant_count);
+        1, shadow, gamma_masks, NULL, RSX_FP_DIALECT_HLSL,
+        out, out_size, out_constant_count);
 }
 
 int rsx_fp_decompile_buffered_shadow_color_expand_ex(
@@ -1404,7 +2034,43 @@ int rsx_fp_decompile_buffered_shadow_color_expand_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask, 0,
-        1, shadow, gamma_masks, expand_masks, out, out_size, out_constant_count);
+        1, shadow, gamma_masks, expand_masks, RSX_FP_DIALECT_HLSL,
+        out, out_size, out_constant_count);
+}
+
+/* The WGSL dialect's public entry points. rsx_fp_decompile_wgsl_ex is the
+ * common case (no shadow/gamma/expand metadata); rsx_fp_decompile_wgsl is
+ * the full one, and both match their HLSL counterparts argument for
+ * argument. See rsx_fp_decompiler.h for the binding contract. */
+int rsx_fp_decompile_wgsl(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 tex_vol_mask,
+    const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],
+    const u8 expand_masks[16],
+    char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask, tex_vol_mask,
+        1, shadow, gamma_masks, expand_masks, RSX_FP_DIALECT_WGSL,
+        out, out_size, out_constant_count);
+}
+
+int rsx_fp_decompile_wgsl_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl,
+    char* out, u32 out_size, u32* out_constant_count)
+{
+    /* The non-buffered form, mirroring rsx_fp_decompile: inline CONST
+     * payloads become literals and there is no PSConstants block. */
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, 0, 0,
+        0, NULL, NULL, NULL, RSX_FP_DIALECT_WGSL,
+        out, out_size, out_constant_count);
+}
+
+int rsx_fp_decompile_wgsl_buffered_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask, 0,
+        1, NULL, NULL, NULL, RSX_FP_DIALECT_WGSL,
+        out, out_size, out_constant_count);
 }
 
 int rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(
@@ -1414,7 +2080,8 @@ int rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask, tex_vol_mask,
-        1, shadow, gamma_masks, expand_masks, out, out_size, out_constant_count);
+        1, shadow, gamma_masks, expand_masks, RSX_FP_DIALECT_HLSL,
+        out, out_size, out_constant_count);
 }
 
 static float fp_half_to_float(u16 h)
@@ -1858,5 +2525,6 @@ int rsx_fp_decompile_buffered_color_ex(
     const u8 gamma_masks[16], char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask, 0,
-        1, NULL, gamma_masks, NULL, out, out_size, out_constant_count);
+        1, NULL, gamma_masks, NULL, RSX_FP_DIALECT_HLSL,
+        out, out_size, out_constant_count);
 }

@@ -27,8 +27,13 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-extern void vm_write32(u32 addr, u32 value);
-extern u32  vm_read32(u32 addr);
+/* uint64_t, matching runtime/ppu/ppu_loader.cpp's definition. A 32-bit
+ * address here is a latent ABI mismatch: it happens to work on x86-64 SysV,
+ * where a 32-bit argument is just the low half of the register, but wasm64
+ * passes an i32 where the callee declares an i64 and wasm-ld reports "function
+ * signature mismatch" and inserts a thunk. Spell it out. */
+extern void vm_write32(uint64_t addr, uint32_t value);
+extern uint32_t vm_read32(uint64_t addr);
 extern unsigned char* vm_base;
 
 /* Fixed guest EA for the virtual camera's frame memory (RAW8 VGA = 300KB).

@@ -59,8 +59,15 @@
 
 /* The signal that parks a thread for SuspendThread on Linux. SIGRTMIN and the
  * two above it belong to the C library's own threading, and SIGRTMIN is not a
- * compile-time constant there, so this is only ever evaluated at run time. */
-#if defined(__linux__)
+ * compile-time constant there, so this is only ever evaluated at run time.
+ *
+ * Emscripten also implements sigaction(SA_SIGINFO) + SIGRTMIN + cross-thread
+ * pthread_kill, and defines neither __linux__ nor _WIN32, so its musl-derived
+ * headers spell the guard out. Adding __EMSCRIPTEN__ rather than widening to
+ * "anything that is not _WIN32" keeps every other POSIX host on its existing
+ * path -- in particular macOS, where this file uses Mach thread_suspend and
+ * must not acquire a signal-based park it never had. */
+#if defined(__linux__) || defined(__EMSCRIPTEN__)
 #  define PS3_SUSPEND_SIGNAL (SIGRTMIN + 4)
 #endif
 

@@ -42,6 +42,7 @@ void     ps3_load_prx_modules(void) {}
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
+#include "../runtime/memory/vm.h"   /* vm_place_guest_window: the wasm64 arena */
 
 #ifdef _WIN32
 #include <windows.h>
@@ -389,8 +390,15 @@ int main(int argc, char** argv)
     vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
     ppu_vm_size = 0;   /* full 32-bit space backed -> OOB guard unnecessary */
 #else
-    vm_base = (uint8_t*)calloc(1, 0xE0000000u);
-    ppu_vm_size = 0xE0000000u;
+    /* See boot_main.cpp: under Emscripten this returns the linker-reserved
+     * window above 4 GB, and NULL everywhere the allocator below is correct. */
+    vm_base = vm_place_guest_window();
+    if (vm_base) {
+        ppu_vm_size = 0;   /* the whole window is backed by linear memory */
+    } else {
+        vm_base = (uint8_t*)calloc(1, 0xE0000000u);
+        ppu_vm_size = 0xE0000000u;
+    }
 #endif
     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
 

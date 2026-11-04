@@ -139,6 +139,17 @@ else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
     # here -- docs/BUILDING.md already lists it as the Linux/macOS dependency.
+    #
+    # Under Emscripten SDL2 is not a package at all: emcc links the wasm build
+    # of it as a linker port (-sUSE_SDL=2) and the headers come from the
+    # sysroot, so there is nothing for find_package(SDL2) to find on a fresh
+    # SDK and the FATAL_ERROR below would fire before anything is compiled.
+    # cmake/emscripten/SDL2Config.cmake answers that find_package with an
+    # INTERFACE target carrying the port flag. SDL2_DIR is set only here, and
+    # only when the caller has not chosen one, so no native host is affected.
+    if(EMSCRIPTEN AND NOT SDL2_DIR)
+        set(SDL2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cmake/emscripten")
+    endif()
     find_package(SDL2 QUIET)
     if(SDL2_FOUND)
         if(TARGET SDL2::SDL2)
@@ -181,6 +192,37 @@ if(PS3RECOMP_RSX_VULKAN)
     target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_VULKAN)
     target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
     message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
+endif()
+
+# ---------------------------------------------------------------------------
+# WebGPU RSX backend (Emscripten only)
+# ---------------------------------------------------------------------------
+# libs/video/rsx_webgpu_backend.c is guarded by __EMSCRIPTEN__ internally, so it
+# compiles to an empty translation unit on every native platform and the block
+# below is inert there by construction -- nothing here reaches a native configure.
+#
+# The port flags are the ones that matter and both are Emscripten-only:
+#
+#   --use-port=emdawnwebgpu  Dawn's webgpu.h-on-WebGPU binding. Required at BOTH
+#                            compile and link: the compile side supplies the
+#                            header and struct layout, the link side supplies the
+#                            JS library and webgpu.cpp. -sUSE_WEBGPU=1 is
+#                            rejected by this port ("emdawnwebgpu may not be used
+#                            with -sUSE_WEBGPU=1"), so it is not an alternative.
+#
+#   -sDEFAULT_TO_CXX         emdawnwebgpu requires a C++ link. The error is
+#                            explicit: "emdawnwebgpu requires C++. Link using
+#                            em++ (or emcc -sDEFAULT_TO_CXX), instead of emcc."
+#                            This keeps every source in the runtime plain C/C++
+#                            as before and only changes how the final link runs.
+#
+# Neither flag is a native build concern, which is why they sit inside
+# if(EMSCRIPTEN) rather than in the shared link line.
+if(EMSCRIPTEN)
+    target_compile_options(ps3recomp_runtime PUBLIC --use-port=emdawnwebgpu)
+    target_link_options(ps3recomp_runtime PUBLIC --use-port=emdawnwebgpu)
+    target_link_options(ps3recomp_runtime PUBLIC -sDEFAULT_TO_CXX)
+    message(STATUS "  WebGPU:       RSX backend enabled (rsx_webgpu_backend.c, emdawnwebgpu)")
 endif()
 
 # cellVdec decodes H.264 / MPEG-2 through FFmpeg when this is on. libavcodec
@@ -407,6 +449,26 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
 
+    # The RSX fragment decompiler's WGSL dialect: the same decode loop that
+    # emits HLSL for D3D12/Metal/Vulkan emits WGSL for WebGPU, so no shader
+    # compiler ships to the browser. Needs nothing but a C compiler -- the
+    # test asserts on the text, and the *.wgsl files it can dump are then
+    # validated with naga when that is installed (tools/validate_fp_wgsl.py).
+    #
+    # Inert when naga is absent: the CMake test runs the C checks only, and
+    # the naga pass is a second test registered only when the tool is found.
+    # That keeps a machine with no Rust toolchain building and testing
+    # everything it otherwise would.
+    add_executable(test_fp_wgsl
+        libs/video/tests/test_fp_wgsl.c
+        libs/video/rsx_fp_decompiler.c
+    )
+    target_include_directories(test_fp_wgsl PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    add_test(NAME fp_wgsl COMMAND test_fp_wgsl)
+
     if(NOT WIN32)
         # The vector single-precision ops against the exact per-lane references.
         add_executable(test_spu_float_exact
@@ -430,6 +492,23 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_rsx_present_policy PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
+    # The WGSL the fragment decompiler emits, validated by naga -- the
+    # reference WGSL implementation, and the front end every WebGPU browser
+    # implementation is built on. Registered only where both naga and Python
+    # are available, so a machine with no Rust toolchain still configures and
+    # builds; the text checks above are the part that always runs.
+    find_program(PS3RECOMP_NAGA naga)
+    if(PS3RECOMP_NAGA)
+        find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+    endif()
+    if(PS3RECOMP_NAGA AND Python3_Interpreter_FOUND)
+        add_test(NAME fp_wgsl_naga
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/validate_fp_wgsl.py"
+                --test "$<TARGET_FILE:test_fp_wgsl>"
+                --naga "${PS3RECOMP_NAGA}")
+        set_tests_properties(fp_wgsl_naga PROPERTIES TIMEOUT 120)
+    endif()
 
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
@@ -460,6 +539,12 @@ if(PS3RECOMP_BUILD_TESTS)
     endif()
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        # The generator's ABI-shape analysis over the real libs/ tree: every
+        # registered handler has a prototype, arity agrees with the independent
+        # audit parser, and the unexpressible set is the accounted-for one.
+        add_test(NAME hle_abi_shape
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_hle_abi_shape.py")
         add_test(NAME loaded_image_memory
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_loaded_image_memory.py")
@@ -472,6 +557,13 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME user_memory_domain
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_user_memory_domain.py")
+        # The WebGPU backend's acceptance test. Its native half always runs (the
+        # backend is inert off Emscripten); its browser half builds the same C for
+        # wasm64 and checks the canvas pixels, and skips loudly when emcc or
+        # Chromium is absent so a runner without them still gets the native half.
+        add_test(NAME rsx_webgpu_backend
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_rsx_webgpu_backend.py")
     endif()
 endif()
 
@@ -631,6 +723,30 @@ if(UNIX)
         )
         target_link_libraries(ps3recomp_boot_smoke PRIVATE ps3recomp_runtime)
         set_target_properties(ps3recomp_boot_smoke PROPERTIES LINKER_LANGUAGE CXX)
+
+        # The HLE dispatch trampoline contract: one translation unit, no guest.
+        # On x86-64 SysV the pre-trampoline single-cast dispatch worked by
+        # accident, so "does the title boot" cannot catch a regression here on
+        # native. What this pins is the property wasm64 enforces at the
+        # instruction -- the trampoline's call has the callee's own type -- plus
+        # the r3 extension the old cast produced, which titles read as (s32)r3.
+        # Self-contained: the dispatcher plus the smallest stubs that link it
+        # (see the test's header). No loader, no guest, no ELF.
+        add_executable(test_hle_trampoline
+            runtime/ppu/tests/test_hle_trampoline.cpp
+            runtime/ppu/ppu_hle.cpp
+        )
+        target_include_directories(test_hle_trampoline PRIVATE
+            "${SMOKE_GEN}"                                 # the generated ppu_recomp.h
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu"
+        )
+        target_link_libraries(test_hle_trampoline PRIVATE ps3recomp_runtime)
+        set_target_properties(test_hle_trampoline PROPERTIES LINKER_LANGUAGE CXX)
+        add_dependencies(test_hle_trampoline ps3recomp_boot_smoke)
+        if(PS3RECOMP_BUILD_TESTS)
+            add_test(NAME hle_trampoline COMMAND test_hle_trampoline)
+        endif()
 
         # Where the runnable image lands, so CI and a developer both say
         #   ./build/ps3recomp_boot_smoke build/smoke/smoke.elf

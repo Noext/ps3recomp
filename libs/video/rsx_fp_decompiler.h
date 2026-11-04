@@ -21,6 +21,24 @@ extern "C" {
 #define RSX_FP_BUFFERED_CONSTANTS_API 1
 #define RSX_FP_MAX_INLINE_CONSTANTS 2048u
 
+/* WebGPU binding numbers for the WGSL dialect's emitted shader. They are
+ * rsx_shader_spirv.h's values on purpose: a WebGPU bind group and a Vulkan
+ * descriptor set then describe the same slots, so one table in the backend
+ * covers both, and the MSL path (register(bN)/tN/sN, mapped by spirv-cross)
+ * agrees with them too. The fragment stage declares only the texture units
+ * the program samples -- a WGSL texture bank cannot be an array without the
+ * wgpu_binding_array extension, so each used unit is its own binding:
+ *   b1 PSConstants   -> binding 1   (vertex constants are b0 / binding 0)
+ *   t0..t15          -> binding 16 + unit
+ *   s0..s15          -> binding 48 + unit
+ * These are a contract with the backend, not an implementation detail; a
+ * backend that binds to them unchanged keeps working when a program's
+ * texture set changes. */
+#define RSX_FP_WGSL_VPCONST_BINDING  0u
+#define RSX_FP_WGSL_PSCONST_BINDING  1u
+#define RSX_FP_WGSL_TEXTURE_BINDING  16u
+#define RSX_FP_WGSL_SAMPLER_BINDING  48u
+
 /* Source capacity for native backends decoding up to 4096 bytecode bytes.
  * Predicated instructions can expand beyond 32 KiB of HLSL. This is a caller
  * allocation size, not a limit imposed by the decompiler API. */
@@ -235,6 +253,46 @@ int rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(
 int rsx_fp_decompile_buffered_shadow_color_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],
+    char* out, u32 out_size, u32* out_constant_count);
+
+/* --- WGSL, for the WebGPU backend ----------------------------------------
+ *
+ * WebGPU takes WGSL and nothing else: it has no HLSL front end, so the
+ * HLSL -> SPIR-V -> (naga) -> WGSL chain would mean shipping glslang (C++)
+ * and naga (Rust) to the browser as two wasm modules. The same decompiler
+ * instead emits WGSL directly through the same decode loop, and the only
+ * thing that changes is the text -- the Dialect block in the .c lists the
+ * constructs, all of them syntax. Use this when the target is WebGPU.
+ *
+ * The emitted module is a complete, self-contained WGSL fragment stage whose
+ * entry point is `main`, taking a PSInput struct and returning either a
+ * vec4<f32> or a PSOutput struct of @location targets plus
+ * @builtin(frag_depth). Bindings are RSX_FP_WGSL_* above, and only the
+ * texture units the program samples are declared.
+ *
+ * Every argument has the same meaning as its HLSL counterpart; these differ
+ * only in the dialect of the out text. out_constant_count is still the
+ * number of PSConstants slots the program reads, so a backend sizes the
+ * uniform buffer identically for either dialect. */
+int rsx_fp_decompile_wgsl(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 tex_vol_mask,
+    const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],
+    const u8 expand_masks[16],
+    char* out, u32 out_size, u32* out_constant_count);
+
+/* As rsx_fp_decompile_wgsl, without the optional texture metadata: the common
+ * case, and the one the WebGPU backend's first pipeline uses. This is the
+ * *buffered* form -- constants live in a PSConstants uniform block, which is
+ * what a real draw does. */
+int rsx_fp_decompile_wgsl_buffered_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    char* out, u32 out_size, u32* out_constant_count);
+
+/* The non-buffered form, mirroring rsx_fp_decompile: inline CONST payloads are
+ * printed as WGSL float literals and there is no uniform block. Useful for a
+ * probe or a golden-text test; a backend wants the buffered one. */
+int rsx_fp_decompile_wgsl_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl,
     char* out, u32 out_size, u32* out_constant_count);
 
 /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).

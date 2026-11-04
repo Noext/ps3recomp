@@ -169,6 +169,13 @@ static u32 s_next_heap_id = 1;
 int g_sys_process_exit_called = 0;
 s32 g_sys_process_exit_code   = 0;
 
+/* Emscripten's musl exit() does not run the atexit chain, so a harness that
+ * installs its verdict with atexit() gets silence there. The boot harness sets
+ * this hook (smoke_recomp.c) and it is called here instead, before exit(),
+ * while every thread and the frame clock are still standing. Native leaves it
+ * null and nothing changes. */
+void (*g_smoke_atexit_hook)(void) = 0;
+
 void sys_process_exit(s32 exitcode)
 {
     g_sys_process_exit_code   = exitcode;
@@ -196,6 +203,9 @@ void sys_process_exit(s32 exitcode)
 #endif
         }
     }
+#if defined(__EMSCRIPTEN__)
+    if (g_smoke_atexit_hook) g_smoke_atexit_hook();
+#endif
     exit(exitcode);
 }
 
