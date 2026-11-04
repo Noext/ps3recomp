@@ -202,7 +202,15 @@ static uint32_t guest_r32(uint32_t addr)
 /* One guest VM, with its size published for the OOB guard above. */
 static uint8_t* host_vm_alloc(void)
 {
-    uint8_t* p = (uint8_t*)calloc(1, VM_SIZE);
+    /* Emscripten: the window is the base the linker reserved above 4 GB, and it
+     * is already zeroed; a calloc here would come back unaligned. Everywhere
+     * else the helper declines and the allocator below is the right answer. */
+    uint8_t* p = vm_place_guest_window();
+    if (p) {
+        ppu_vm_size = VM_SIZE;
+        return p;
+    }
+    p = (uint8_t*)calloc(1, VM_SIZE);
     if (p) ppu_vm_size = VM_SIZE;
     return p;
 }
