@@ -43,8 +43,13 @@ void ps3_msf(const char* fmt, ...) { (void)fmt; }
 void ps3_ms_kv(const char* key, long long v) { (void)key; (void)v; }
 void ps3_ms_dump(void) {}
 long long ps3_ms_now(void) { return 0; }
-void vm_write32(uint32_t a, uint32_t v) { (void)a; (void)v; }
-uint32_t vm_read32(uint32_t a) { (void)a; return 0; }
+/* Signature must match the canonical definition in runtime/ppu/ppu_loader.cpp:
+ * vm_write32(uint64_t, uint32_t). It is declared uint32_t in a few older call
+ * sites because on x86-64 SysV the difference is invisible, but under wasm64
+ * the indirect-call type check turns any mismatch into a link warning and a
+ * runtime trap. */
+void vm_write32(uint64_t a, uint32_t v) { (void)a; (void)v; }
+uint32_t vm_read32(uint64_t a) { (void)a; return 0; }
 uint32_t gcm_io_offset_to_ea(uint32_t o) { return o; }
 uint32_t cellGcmResolveLocated(int location, uint32_t offset) { (void)location; return offset; }
 uint32_t cellGcmResolveOffset(uint32_t offset) { return offset; }
