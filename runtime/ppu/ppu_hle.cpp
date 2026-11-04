@@ -8,11 +8,13 @@
  * the PPC calling convention into a native C call.
  *
  * PPC64 ELFv1 integer/pointer ABI: arguments in r3..r10 (gpr[3..10]), return
- * value in r3. The generic adapter casts the handler to a uint64-in/uint64-out
- * function and passes the 8 GPR argument slots; this covers the large majority
- * of cellXxx APIs (integer args/handles, s32 return). Functions that take or
- * return *pointers* need host<->guest address translation and so require a
- * per-function wrapper -- the generic path passes the raw value through.
+ * value in r3. Handlers are reached through a generated trampoline with that
+ * uniform 8-slot signature which calls the handler through its own prototype;
+ * see the note above the dispatch site for why a single cast is not enough.
+ * This covers the large majority of cellXxx APIs (integer args/handles, s32
+ * return). Functions that take or return *pointers* need host<->guest address
+ * translation and so require a per-function wrapper -- the generic path passes
+ * the raw value through.
  *
  * Compiled as C++ (matches the lifted output). Game-agnostic.
  */
@@ -27,6 +29,18 @@
 #include <stdio.h>
 #include <stdlib.h>       /* getenv, atoi (boot trace) */
 
+/* The uniform HLE dispatch signature every trampoline has. Args are the eight
+ * PPC64 integer argument registers r3..r10; the return value becomes r3.
+ *
+ * The leading const void* is the handler's own address. It is what lets a
+ * generated trampoline be shared by every handler with the same ABI shape: the
+ * table below stores one trampoline per shape and passes the handler's address
+ * as the first argument at the call site, rather than generating a distinct
+ * body per NID. */
+typedef uint64_t (*hle_trampoline)(const void*, uint64_t, uint64_t, uint64_t,
+                                   uint64_t, uint64_t, uint64_t, uint64_t,
+                                   uint64_t);
+
 /* Single flat NID -> handler table (all modules share it; resolution is by
  * NID which is globally unique). Sized for the firmware import surface. */
 #define HLE_NID_CAP 4096
@@ -34,10 +48,47 @@ static ps3_nid_entry  g_hle_storage[HLE_NID_CAP];
 static ps3_nid_table  g_hle_nids;
 static int            g_hle_inited = 0;
 
+/* How a NID's handler is called, in one of two forms.
+ *
+ * a trampoline (non-null): call it with the handler's own address and r3..r10.
+ *   This is how a generated table entry is dispatched, and the only form that
+ *   is correct under wasm64 -- see the note on ps3_hle_call below.
+ *
+ * no trampoline (null): legacy, call the handler through a cast to the 8x-u64
+ *   signature. Kept for the handful of handlers whose prototype cannot be
+ *   expressed as a trampoline (float arguments, >8 parameters) and for
+ *   hand-registered handlers in tests. Native-only in effect; under wasm64 such
+ *   a call traps, which is why the generator names those NIDs on stderr rather
+ *   than silently emitting one. */
+static hle_trampoline g_hle_tramp[HLE_NID_CAP];
+
+/* Indexed by the NID table slot, so the lookup costs nothing beyond the single
+ * linear NID search the dispatcher already does -- no second structure and no
+ * second scan. Both registration paths append to g_hle_nids, so a row's slot is
+ * the index it was appended at; ps3_hle_register_trampolined records the
+ * trampoline against the slot ps3_hle_register has just filled. */
+static void hle_tramp_set_slot(uint32_t before, hle_trampoline t)
+{
+    /* Only if the row was actually appended -- a full table rejects it, and
+     * writing the trampoline then would attach it to somebody else's handler. */
+    if (t && g_hle_nids.count > before) g_hle_tramp[before] = t;
+}
+
 extern "C" void ps3_hle_register(uint32_t nid, const char* name, void* handler)
 {
     if (!g_hle_inited) { ps3_nid_table_init(&g_hle_nids, g_hle_storage, HLE_NID_CAP); g_hle_inited = 1; }
     ps3_nid_table_add(&g_hle_nids, nid, name, handler);
+}
+
+/* Register a handler together with the trampoline that calls it. Generated
+ * tables use this for every handler whose ABI shape a trampoline can express;
+ * ps3_hle_register above stays for the rest (and for tests). */
+extern "C" void ps3_hle_register_trampolined(uint32_t nid, const char* name,
+                                             void* fn, hle_trampoline t)
+{
+    const uint32_t before = g_hle_inited ? g_hle_nids.count : 0;
+    ps3_hle_register(nid, name, fn);
+    hle_tramp_set_slot(before, t);
 }
 
 extern "C" uint32_t ps3_hle_count(void) { return g_hle_inited ? g_hle_nids.count : 0; }
@@ -806,9 +857,29 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                     (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],
                     (uint32_t)ctx->gpr[6],(uint32_t)ctx->gpr[7],(uint32_t)ctx->gpr[8]);
     }
-    hle_generic fn = (hle_generic)e->handler;
-    uint64_t r = fn(ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6],
-                    ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10]);
+    /* Dispatch through the handler's trampoline when it has one. The trampoline
+     * is generated (tools/gen_hle_nids.py) with the uniform 8-slot signature and
+     * calls the handler through the handler's own prototype, so the call's type
+     * is the callee's type. Under wasm64 an indirect call is checked against the
+     * callee's function type at the instruction, so the old cast below -- one
+     * fixed 8x-u64 signature for every handler regardless of its real prototype
+     * -- trapped on the first HLE import a title reached:
+     *
+     *     RuntimeError: null function or function signature mismatch
+     *
+     * The cast is kept only for handlers no trampoline could be built for
+     * (float arguments, more than eight parameters) and for hand-registered
+     * ones, where it preserves the pre-wasm behaviour exactly on native. */
+    uint64_t r;
+    hle_trampoline tramp = g_hle_tramp[(uint32_t)(e - g_hle_nids.entries)];
+    if (tramp) {
+        r = tramp(e->handler, ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6],
+                  ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10]);
+    } else {
+        hle_generic fn = (hle_generic)e->handler;
+        r = fn(ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6],
+               ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10]);
+    }
     ctx->gpr[3] = r;   /* PPC return value */
     /* PS3_HLE_PTRCHECK: the guest stores HLE return values as guest pointers, so
      * an HLE returning a value outside guest RAM (>= 0x10000000) that is not a

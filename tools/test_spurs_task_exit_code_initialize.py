@@ -31,6 +31,18 @@ uint32_t ppu_vm_size;
 void register_exit_code_fixture(void);
 }
 static void* handler;
+/* The generated table registers through a trampoline (docs/HLE_DISPATCH_ABI.md);
+ * the handler under test is the first argument, exactly as before. */
+extern "C" void ps3_hle_register_trampolined(unsigned nid, const char*, void* fn,
+                                             unsigned long (*)(const void*,
+                                                               unsigned long, unsigned long,
+                                                               unsigned long, unsigned long,
+                                                               unsigned long, unsigned long,
+                                                               unsigned long, unsigned long)) {
+    assert(nid == 0x34552FA6u);
+    assert(!handler);
+    handler = fn;
+}
 extern "C" void ps3_hle_register(unsigned nid, const char*, void* fn) {
     assert(nid == 0x34552FA6u);
     assert(!handler);
@@ -89,6 +101,13 @@ int main() {
 }
 '''
 
+TRAMP_DECL = (
+    '#include <stdint.h>\n'
+    'extern "C" void ps3_hle_register_trampolined(unsigned,const char*,void*,\n'
+    '    unsigned long (*)(const void*, unsigned long, unsigned long, unsigned long,\n'
+    '                      unsigned long, unsigned long, unsigned long, unsigned long,\n'
+    '                      unsigned long));\n')
+
 with tempfile.TemporaryDirectory(prefix='spurs-exit-initialize-') as name:
     tmp=Path(name)
     generated=tmp/'nids.cpp'
@@ -96,11 +115,19 @@ with tempfile.TemporaryDirectory(prefix='spurs-exit-initialize-') as name:
                     'cellSpurs','--out',str(generated)],check=True)
     # Compile the actual generator's target registration statement, omitting
     # unrelated registrations whose handlers need worker/runtime dependencies.
-    entries=[line for line in generated.read_text().splitlines()
-             if 'ps3_hle_register(0x34552FA6u,' in line]
+    text = generated.read_text()
+    entries=[line for line in text.splitlines()
+             if 'ps3_hle_register_trampolined(0x34552FA6u,' in line]
     assert len(entries)<=1
+    # The row names the shared thunk for the handler's ABI shape; its body is in
+    # this same generated unit, so pull the one function in beside the row.
+    thunk = entries[0].rsplit(',', 1)[1].strip().rstrip(');').strip() if entries else ''
+    thunk_body = ''
+    if thunk:
+        chunk = text.split('static uint64_t ' + thunk + '(')[1]
+        thunk_body = 'static uint64_t ' + thunk + '(' + chunk.split('\n}\n')[0] + '\n}\n'
     registration=tmp/'registration.cpp'
-    registration.write_text('extern "C" void ps3_hle_register(unsigned,const char*,void*);\n'
+    registration.write_text(TRAMP_DECL + thunk_body +
         'extern "C" void cellSpursTaskExitCodeInitialize(void);\n'
         'extern "C" void register_exit_code_fixture(void) {\n'+
         '\n'.join(entries)+'\n}\n')
